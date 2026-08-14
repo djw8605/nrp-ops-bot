@@ -126,8 +126,12 @@ spec:
   resources:
     requests:
       storage: 1Gi
-  # Verified 2026-08-14 against the live cluster: the RWX CephFS class is called
-  # `cephfs` (provisioner rook-ceph.cephfs.csi.ceph.com). There is no
-  # `rook-cephfs` class, so the previous value would have left the PVC Pending
-  # forever and the agent stuck without a docs index.
-  storageClassName: cephfs
+  # One class per Ceph cluster. This pins the docs index to the *central*
+  # cluster (provisioner rook-system.cephfs.csi.ceph.com), rather than the
+  # `cephfs` class, which is a different cluster
+  # (rook-ceph.cephfs.csi.ceph.com) and left this PVC Pending.
+  #
+  #   NOTE: storageClassName is immutable on an existing PVC. Changing it here
+  #   does not migrate a live claim -- the claim must be deleted and recreated,
+  #   or the sync fails with a field-immutable error.
+  storageClassName: rook-cephfs-central
