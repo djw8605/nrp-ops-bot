@@ -22,7 +22,8 @@ and replies in-thread with a finding, cited evidence, and the exact tool calls i
 > question about failing pods in `coder` resolved in 4 tool calls to a correct, evidenced answer.
 > See [Testing it locally](#testing-it-locally).
 >
-> Still untested: a real Slack workspace, and the container image itself.
+> Slack tokens are sealed into `deploy/sealedsecret-tokens.yaml` and verified against `auth.test`
+> (workspace **NRP**, bot `nrp_ops_bot`). Still untested: the bot answering a real mention.
 
 ---
 
@@ -334,8 +335,10 @@ operator questions went from 2/10 to 8/10.
    the build job runs it under the deployment's own security context and asserts the playbooks and
    all nine tools load, so a broken image fails the pipeline rather than reaching ArgoCD — but no
    one has watched it happen yet.
-2. **Slack team ID and operator/channel IDs** in `deploy/configmap-allowlist.yaml`, and the
-   `NRP_OPS_SLACK_TEAM_ID` env in `deploy/deployment.yaml`. Still placeholders.
+2. **Operator and channel IDs** in `deploy/configmap-allowlist.yaml` — still `U00000000000` /
+   `C00000000000`. The team ID and model are now set, and the tokens are sealed and verified
+   against `auth.test`, but with placeholder operator IDs the bot starts cleanly and ignores
+   everyone.
 3. **`deploy/networkpolicy.yaml`** — the API server CIDR, and the fact that the fallback egress rule
    permits any public HTTPS destination. Needs cluster access to confirm. A CiliumNetworkPolicy with
    FQDN rules is sketched in that file and is the version you want if Cilium is the CNI.
@@ -482,31 +485,35 @@ The cluster runs the sealed-secrets controller (`sealed-secrets` in namespace
 `Secret` must never be committed, but the `SealedSecret` it becomes is encrypted to *this cluster's*
 key and is safe in a public repo.
 
-Generate it — note `--dry-run=client`, so the plaintext Secret never reaches the API server:
+**`deploy/sealedsecret-tokens.yaml` is already generated and committed**, and
+`deploy/kustomization.yaml` references it. Nothing further is needed unless a token changes.
+
+To regenerate — reading straight from `.env` and piping, so the plaintext Secret is never written to
+disk and never reaches the API server (`--dry-run=client`):
 
 ```bash
-kubectl -n nrp-ops-agent create secret generic nrp-ops-agent-tokens \
-  --from-literal=NRP_OPS_SLACK_BOT_TOKEN=xoxb-... \
-  --from-literal=NRP_OPS_SLACK_APP_TOKEN=xapp-... \
-  --from-literal=NRP_OPS_LLM_API_KEY=... \
-  --dry-run=client -o yaml > secret-tokens.yaml
+set -a; . ./.env; set +a
+kubectl create secret generic nrp-ops-agent-tokens --namespace nrp-ops-agent \
+  --from-literal=NRP_OPS_SLACK_BOT_TOKEN="$NRP_OPS_SLACK_BOT_TOKEN" \
+  --from-literal=NRP_OPS_SLACK_APP_TOKEN="$NRP_OPS_SLACK_APP_TOKEN" \
+  --from-literal=NRP_OPS_LLM_API_KEY="$NRP_OPS_LLM_API_KEY" \
+  --dry-run=client -o yaml \
+| kubeseal --controller-name sealed-secrets --controller-namespace sealed-secrets-operator \
+    --format yaml > deploy/sealedsecret-tokens.yaml
 ```
 
-```bash
-kubeseal --controller-name sealed-secrets --controller-namespace sealed-secrets-operator \
-  --format yaml < secret-tokens.yaml > deploy/sealedsecret-tokens.yaml
-```
+Seal **only** these three. `.env` also holds `NRP_OPS_LLM_MODEL` and `NRP_OPS_PROMETHEUS_BASE_URL`,
+which are not secrets and are set in `deploy/deployment.yaml` — and note that an explicit `env`
+entry there *overrides* the same key arriving through `envFrom`, so a value sealed into the Secret
+would lose to the manifest anyway.
 
-```bash
-rm secret-tokens.yaml
-```
+> **Strict scope.** The ciphertext is bound to both the name `nrp-ops-agent-tokens` and the
+> namespace `nrp-ops-agent`. Rename either and the controller cannot decrypt it — and it reports
+> that in its own log rather than failing the sync, so the symptom is a pod stuck without
+> credentials rather than an obvious error. Re-seal instead of editing.
 
-Then uncomment `- sealedsecret-tokens.yaml` in `deploy/kustomization.yaml` and commit **only** the
-sealed file. `secret-tokens.yaml` and `*.secret.yaml` are in `.gitignore` so the plaintext cannot be
+`.env`, `secret-tokens.yaml` and `*.secret.yaml` are all in `.gitignore`, so plaintext cannot be
 committed by accident.
-
-> The namespace is encoded into the sealed value. A SealedSecret sealed for `nrp-ops-agent` will not
-> decrypt anywhere else, so create the namespace before sealing and re-seal if you ever move it.
 
 Rotating a token means repeating the above and pushing — ArgoCD applies the new SealedSecret, but
 the Deployment does not restart on a Secret change, so finish with:
@@ -528,10 +535,11 @@ kubectl -n nrp-ops-agent rollout restart deployment/nrp-ops-agent
    ```
    `argocd/application.yaml` also sets these via `managedNamespaceMetadata`, which keeps them under
    GitOps rather than depending on whoever ran the command above.
-2. **Seal the tokens** (previous section) and uncomment the resource.
-3. **Fill in the two remaining placeholders**: `NRP_OPS_SLACK_TEAM_ID` in `deploy/deployment.yaml`,
-   and the operator/channel IDs in `deploy/configmap-allowlist.yaml`. The agent denies everyone
-   until those are real.
+2. ~~Seal the tokens~~ — done; `deploy/sealedsecret-tokens.yaml` is committed and wired in.
+3. **Fill in the operator and channel IDs** in `deploy/configmap-allowlist.yaml`. Still
+   `U00000000000` / `C00000000000`, and **the agent denies everyone until they are real** — a
+   deployment with placeholders starts cleanly and ignores every message. `NRP_OPS_SLACK_TEAM_ID`
+   and `NRP_OPS_LLM_MODEL` are already set.
 4. **Make the GHCR package readable by the cluster.** It is created private on first push; either
    make it public or add a pull secret.
 5. **Register the Application**, after checking with the NRP admins which ArgoCD instance and

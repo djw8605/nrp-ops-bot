@@ -50,8 +50,14 @@ spec:
             - secretRef:
                 name: nrp-ops-agent-tokens
           env:
+            # The NRP workspace (nrp-chat.slack.com), confirmed via auth.test
+            # on 2026-08-14. An identifier, not a credential -- it belongs in
+            # git. Events from any other team are refused, which is what closes
+            # the Slack Connect hole: the *envelope* team is checked, never the
+            # inner event's team, which for a Connect message is the author's
+            # workspace rather than this one.
             - name: NRP_OPS_SLACK_TEAM_ID
-              value: "T00000000000"  # TODO: replace with the NRP workspace team ID
+              value: "T0B355062KS"
             - name: NRP_OPS_ALLOWLIST_PATH
               value: /etc/nrp-ops-agent/allowlist.yaml
             - name: NRP_OPS_KUBE_MODE
@@ -60,8 +66,13 @@ spec:
               value: https://thanos.nrp-nautilus.io
             - name: NRP_OPS_LLM_BASE_URL
               value: https://ellm.nrp-nautilus.io/v1
+            # Verified to emit OpenAI-style tool_calls, which the loop depends
+            # on. Not a secret, so it is set here rather than in the Secret --
+            # and it MUST be, because an explicit `env` entry overrides the same
+            # key arriving via `envFrom`: an empty value here would win over a
+            # correct one in the Secret and the pod would refuse to start.
             - name: NRP_OPS_LLM_MODEL
-              value: ""  # TODO: required -- the pod refuses to start while empty
+              value: "deepseek-v4-flash"
             - name: NRP_OPS_DOCS_DB_PATH
               value: /var/lib/nrp-ops-agent/docs.sqlite3
             - name: NRP_OPS_AUDIT_STREAM

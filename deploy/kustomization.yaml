@@ -33,11 +33,13 @@ resources:
   - deployment.yaml
   - cronjob-docs-sync.yaml
   - networkpolicy.yaml
-  # Uncomment once you have generated it -- see "Secrets" in the README. It is
-  # not listed by default because kustomize fails hard on a missing resource,
-  # and the file cannot be committed until someone runs kubeseal against this
-  # cluster. A SealedSecret is safe to commit; a Secret is not.
-  # - sealedsecret-tokens.yaml
+  # Encrypted to this cluster's sealed-secrets key, so it is safe in a public
+  # repo: only the controller in this cluster can decrypt it. Sealed with the
+  # default strict scope, which binds the ciphertext to BOTH the name
+  # `nrp-ops-agent-tokens` and the namespace `nrp-ops-agent` -- renaming either
+  # makes it undecryptable and the controller will log that rather than fail
+  # loudly, so re-seal instead of editing.
+  - sealedsecret-tokens.yaml
 
 # Rewritten by .github/workflows/build-container.yml on every push to main.
 # Both the Deployment and the docs-sync CronJob run the same image, so this one
