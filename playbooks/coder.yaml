@@ -7,6 +7,7 @@ match: ["coder", "code-server", "workspace", "workspaces"]
 namespaces: ["coder"]
 docs_hints:
   - "admindocs/upgrades/coder"
+  - "userdocs/coder/coder"
   - "userdocs/coder/deploy"
 steps:
   - name: workload health
@@ -24,20 +25,25 @@ steps:
   - name: ingress error rate
     tool: promql
     args:
-      query: 'sum(rate(nginx_ingress_controller_requests{exported_namespace="coder",status=~"5.."}[5m]))'
+      query: 'sum(rate(haproxy_backend_http_responses_total{proxy="coder_coder_http",code="5xx"}[5m]))'
     note: >-
-      TODO: verify against live Prometheus. Non-zero with healthy pods means the
-      failure is between the ingress and the service, not in coder itself.
+      Verified against live Thanos. NRP fronts services with haproxy, not the
+      nginx ingress controller -- no nginx_ingress_controller_* metric exists on
+      this cluster, so the previous query returned an empty result rather than an
+      error, which reads exactly like "no errors". Backends are named
+      <namespace>_<service>_<port>. Non-zero with healthy pods means the failure
+      is between the ingress and the service, not in coder itself.
 
   - name: ingress request rate baseline
     tool: promql
     args:
-      query: 'sum(rate(nginx_ingress_controller_requests{exported_namespace="coder"}[5m]))'
+      query: 'sum(rate(haproxy_backend_http_requests_total{proxy="coder_coder_http"}[5m]))'
       lookback: 6h
       step: 5m
     note: >-
-      TODO: verify against live Prometheus. A rate that fell to zero means users
-      stopped reaching the ingress at all -- look at DNS/LB, not at coder.
+      Verified against live Thanos. A rate that fell to zero means users stopped
+      reaching the ingress at all -- look at DNS/LB, not at coder. Sits around
+      1 req/s when healthy.
 
   - name: recent events
     tool: get_events

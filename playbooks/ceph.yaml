@@ -1,48 +1,82 @@
 # Rook/Ceph storage. Symptoms reach operators as "my pod is stuck ContainerCreating"
 # or "writes are hanging", both of which are storage rather than the workload.
+#
+# Verified 2026-08-14 against live Thanos. The important correction: NRP runs
+# NINE independent Ceph clusters, one per namespace, and there is no namespace
+# called `rook-ceph`. Every step here must name a specific cluster, and a
+# question like "is Ceph healthy?" has nine answers, not one.
 service: ceph
 match: ["ceph", "rook", "storage", "pvc", "volume", "cephfs", "rbd", "s3"]
-namespaces: ["rook-ceph"]
+namespaces:
+  - "rook"
+  - "rook-central"
+  - "rook-east"
+  - "rook-ucsd"
+  - "rook-tide"
+  - "rook-south-east"
+  - "rook-pacific"
+  - "rook-haosu"
+  - "rook-fullerton"
+  - "rook-system"
 docs_hints:
-  - "admindocs/storage"
-  - "userdocs/storage"
+  - "admindocs/storage/ceph"
+  - "admindocs/storage/broken-drives"
+  - "userdocs/storage/ceph"
 steps:
-  - name: ceph health
+  - name: ceph health per cluster
     tool: promql
     args:
-      query: 'ceph_health_status'
+      query: 'max by (namespace) (ceph_health_status)'
     note: >-
-      TODO: verify against live Prometheus (requires the Ceph mgr prometheus
-      module). 0 = HEALTH_OK, 1 = HEALTH_WARN, 2 = HEALTH_ERR.
+      Verified against live Thanos; returns one series per Ceph cluster, keyed by
+      namespace. 0 = HEALTH_OK, 1 = HEALTH_WARN, 2 = HEALTH_ERR. Most clusters
+      sit at HEALTH_WARN as a steady state here, so WARN alone is not an
+      incident -- say which cluster and pair it with the checks below. Always
+      report the namespace; "Ceph is unhealthy" is not an actionable answer.
 
-  - name: osds down
+  - name: osds down per cluster
     tool: promql
     args:
-      query: 'count(ceph_osd_up == 0)'
-    note: "TODO: verify against live Prometheus."
-
-  - name: pool fullness
-    tool: promql
-    args:
-      query: 'topk(5, ceph_pool_percent_used)'
+      query: 'count by (namespace) (ceph_osd_up == 0)'
     note: >-
-      TODO: verify against live Prometheus. A pool near full makes writes hang
-      rather than fail, which is why users report "slow" not "broken".
+      Verified against live Thanos. Must be count, not sum: `ceph_osd_up == 0`
+      is a filter that keeps series whose value is 0, so summing them always
+      yields 0 no matter how many OSDs are down.
+
+  - name: pool fullness per cluster
+    tool: promql
+    args:
+      query: 'topk(5, max by (namespace, pool_id) (ceph_pool_percent_used))'
+    note: >-
+      Verified against live Thanos. IMPORTANT: despite the name, this is a
+      FRACTION in 0..1, not a percentage -- 0.84 means 84% full, not 0.84%.
+      Multiply by 100 before reporting it to an operator. A pool near full makes
+      writes hang rather than fail, which is why users report "slow" not
+      "broken".
 
   - name: rook-ceph pods
     tool: list_pods
-    args: {namespace: rook-ceph}
-    note: mon quorum needs a majority of rook-ceph-mon-* Running.
+    args: {namespace: "<the rook-* namespace identified above>"}
+    note: >-
+      mon quorum needs a majority of rook-ceph-mon-* Running. Pick the namespace
+      from the health query rather than guessing; there is no `rook-ceph`.
 
   - name: manager health
     tool: get_workload
-    args: {kind: deployment, namespace: rook-ceph, name: rook-ceph-mgr-a}
-    note: "TODO: verify the mgr deployment name in this cluster."
+    args: {kind: deployment, namespace: "<the rook-* namespace identified above>", name: rook-ceph-mgr-a}
+    note: >-
+      Verified: `rook-ceph-mgr-a` is the mgr deployment name, but it exists once
+      per cluster namespace. If the mgr is down, the ceph_* metrics above go
+      stale and will mislead rather than report an outage.
 
   - name: storage events
     tool: get_events
-    args: {namespace: rook-ceph, since_seconds: 3600}
+    args: {namespace: "<the rook-* namespace identified above>", since_seconds: 3600}
 
   - name: runbook
     tool: search_docs
-    args: {query: "ceph pvc pending troubleshooting", section: admindocs}
+    args: {query: "ceph pvc troubleshooting", section: admindocs}
+    note: >-
+      Note the docs have no page on PVCs stuck Pending -- admindocs/storage/
+      user-pvc-issues covers XFS corruption instead. Do not stretch that page
+      into an answer about scheduling.

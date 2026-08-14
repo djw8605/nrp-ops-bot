@@ -172,6 +172,23 @@ async def _clients() -> KubeClients:
     return _clients_singleton
 
 
+async def aclose_clients() -> None:
+    """Close the shared ApiClient and forget it.
+
+    The long-running Slack process holds exactly one of these for its lifetime,
+    so this is not leak cleanup -- it is for short-lived entry points such as
+    ``nrp-ops-ask``, where an unclosed aiohttp session prints a warning at
+    interpreter shutdown that looks like a fault in the answer just printed.
+    """
+    global _clients_singleton
+    if _clients_singleton is None:
+        return
+    api = getattr(_clients_singleton.core, "api_client", None)
+    _clients_singleton = None
+    if api is not None:
+        await api.close()
+
+
 def _require_namespace(namespace: str) -> str:
     """Deny-by-default namespace gate, called inside every namespaced tool."""
     if not get_allowlist_loader().load().namespace_allowed(namespace):

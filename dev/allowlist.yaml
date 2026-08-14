@@ -1,0 +1,35 @@
+# Local development policy, for `nrp-ops-ask` and the eval harness.
+#
+#   export NRP_OPS_ALLOWLIST_PATH=dev/allowlist.yaml
+#
+# This is NOT the deployed policy -- deploy/configmap-allowlist.yaml is, and it
+# is the one that matters. This copy exists because the default path is
+# /etc/nrp-ops-agent/allowlist.yaml, which does not exist on a laptop, and an
+# absent policy file is deny-everything. Without it every Kubernetes tool
+# refuses before making an API call, which reads exactly like an empty cluster
+# rather than a misconfiguration.
+#
+# `operators` and `channels` are empty on purpose: the CLI has no Slack user to
+# authorize, and leaving real IDs here would be the one place they could drift
+# out of sync with the ConfigMap unnoticed.
+operators: []
+channels: []
+
+# Kept in step with deploy/configmap-allowlist.yaml. Verified against the live
+# cluster on 2026-08-14: there is no `jupyterhub` or `rook-ceph` namespace.
+namespaces:
+  - coder
+  - coder-dev
+  - coder-user-dev
+  - jupyterlab
+  - jupyterlab-east
+  - "rook"
+  - "rook-*"
+  - gpu-operator
+
+namespaces_denied:
+  - kube-system
+  - kube-public
+  - kube-node-lease
+  - cert-manager
+  - nrp-ops-agent

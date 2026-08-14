@@ -29,6 +29,8 @@ dev = [
 [project.scripts]
 nrp-ops-agent = "nrp_ops_agent.slack_app:main"
 nrp-ops-docs-sync = "nrp_ops_agent.docs_index.sync:main"
+# Development only: asks one question through the same loop the Slack app uses.
+nrp-ops-ask = "nrp_ops_agent.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -36,6 +38,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nrp_ops_agent"]
+
+# The runbooks live at the repository root so ArgoCD and operators can edit them
+# next to the manifests, but they must also travel inside the wheel -- otherwise
+# the container starts with no playbooks and says nothing about it.
+[tool.hatch.build.targets.wheel.force-include]
+"playbooks" = "nrp_ops_agent/playbooks"
 
 [tool.ruff]
 line-length = 100

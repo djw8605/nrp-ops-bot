@@ -21,7 +21,26 @@ from typing import Any, Final
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-DEFAULT_PLAYBOOK_DIR: Final = Path(__file__).resolve().parents[2] / "playbooks"
+
+def _default_playbook_dir() -> Path:
+    """Locate the shipped playbooks in both an installed and a source tree.
+
+    The wheel force-includes ``playbooks/`` as ``nrp_ops_agent/playbooks``, so
+    in a container the runbooks sit next to this module. In an editable dev
+    checkout they do not, and the repository-root copy is the live one.
+
+    Getting this wrong is silent: ``load_playbooks`` treats a missing directory
+    as "no playbooks" rather than an error, so a container that resolved this to
+    a path that does not exist would start clean, answer every question without
+    a runbook, and never say why.
+    """
+    packaged = Path(__file__).resolve().parent / "playbooks"
+    if packaged.is_dir():
+        return packaged
+    return Path(__file__).resolve().parents[2] / "playbooks"
+
+
+DEFAULT_PLAYBOOK_DIR: Final = _default_playbook_dir()
 _DEFAULT_NAME: Final = "_default"
 
 

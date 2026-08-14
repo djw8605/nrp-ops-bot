@@ -1,0 +1,72 @@
+---
+# Slack app manifest for the nrp-ops agent.
+#
+#   https://api.slack.com/apps -> Create New App -> From an app manifest
+#   -> pick the NRP workspace -> paste this file -> Create
+#
+# This sets the scopes, the event subscriptions and Socket Mode in one step,
+# which is the part that is easy to get subtly wrong by clicking through the UI.
+#
+# IT DOES NOT CREATE THE APP-LEVEL TOKEN. A manifest cannot mint credentials.
+# After creating the app you still need two tokens, from two different pages:
+#
+#   xapp-...  Basic Information -> App-Level Tokens -> Generate Token and Scopes
+#             -> add the `connections:write` scope.
+#             (Settings -> Socket Mode also offers to create it for you.)
+#             This one is easy to miss because every other token in Slack lives
+#             under OAuth & Permissions, and this one does not.
+#
+#   xoxb-...  Install to Workspace, then OAuth & Permissions -> Bot User OAuth
+#             Token. Only exists after installation.
+#
+# You also need the workspace team ID (T...) for NRP_OPS_SLACK_TEAM_ID, and the
+# Slack user IDs of the operators for deploy/configmap-allowlist.yaml. Get a
+# member ID from a Slack profile -> ... -> Copy member ID.
+
+display_information:
+  name: nrp-ops
+  description: Read-only Nautilus cluster diagnostics, in natural language.
+  background_color: "#1f2d3d"
+  long_description: >-
+    Answers operator questions about the National Research Platform cluster by
+    investigating it read-only: pods, events, workloads, nodes, PromQL and the
+    nrp.ai documentation. It cannot exec, port-forward, read Secrets, or write
+    anything at all -- those are denied in RBAC, not by prompting. Replies land
+    in-thread with the finding, the evidence, and the exact tool calls made.
+
+features:
+  bot_user:
+    display_name: nrp-ops
+    # Socket Mode holds one connection while the pod runs, so presence would
+    # advertise pod health to every user. Nothing reads it; leave it off.
+    always_online: false
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read   # see @nrp-ops in an allowlisted channel
+      - chat:write          # post and edit the reply
+      - im:history          # read DMs the bot is a party to
+      - reactions:write     # react to a denied message, which is the only
+                            # signal a denial produces -- the bot posts no text
+                            # on deny so it cannot be used to enumerate the
+                            # operator allowlist
+
+# Deliberately NOT requested: channels:history, groups:history, users:read,
+# files:read. The agent authorizes on user ID and never needs the directory or
+# the ability to read channel backlog. Adding any of them widens what a prompt
+# injection could reach.
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+  interactivity:
+    is_enabled: false
+  # Socket Mode means Slack never calls in: the pod dials out and holds a
+  # WebSocket. That is why deploy/networkpolicy.yaml is `ingress: []` and the
+  # kustomization renders no Service -- there is no inbound path to secure.
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

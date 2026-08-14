@@ -186,9 +186,11 @@ def url_for(rel_path: Path, site_base_url: str) -> str:
     ``src/content/docs/Documentation/admindocs/upgrades/coder.mdx``
     becomes ``https://nrp.ai/documentation/admindocs/upgrades/coder``.
 
-    TODO: verify -- Starlight slug casing. This lowercases the whole path, which
-    matches the known ``Documentation/`` -> ``/documentation/`` mapping, but a
-    page whose filename is genuinely mixed-case would get the wrong URL.
+    Verified 2026-08-14 against the live site: indexing the real docs repo
+    produced 146 distinct page URLs, every one of which appears in
+    https://nrp.ai/sitemap-0.xml. All 234 sitemap entries are lowercase and
+    none carries a trailing slash, so the wholesale lowercasing below is right
+    and there is no mixed-case filename to get wrong.
     """
     parts = list(rel_path.with_suffix("").parts)
     if parts and parts[-1].lower() == "index":

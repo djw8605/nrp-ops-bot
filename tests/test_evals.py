@@ -140,6 +140,36 @@ class TestSummary:
         assert summarise([], "m")["pass_rate"] == 0.0
 
 
+class TestCasesMatchTheDeployedPolicy:
+    def test_every_case_namespace_is_permitted_by_the_shipped_allowlist(self) -> None:
+        """A case expecting a namespace the agent is configured to refuse scores
+        the wrong behaviour as correct. This suite previously expected
+        `jupyterhub` and `rook-ceph`, neither of which exists on the cluster, so
+        it would have certified the exact bug it was written to catch.
+
+        Cases with ``namespace: null`` are cluster-wide or deliberately
+        out-of-scope and are skipped.
+        """
+        import fnmatch
+
+        import yaml
+
+        repo_root = Path(__file__).resolve().parents[1]
+        manifest = yaml.safe_load(
+            (repo_root / "deploy" / "configmap-allowlist.yaml").read_text(encoding="utf-8")
+        )
+        policy = yaml.safe_load(manifest["data"]["allowlist.yaml"])
+        patterns: list[str] = policy["namespaces"]
+
+        for case in load_cases():
+            if case.namespace is None or case.expect_denied:
+                continue
+            assert any(fnmatch.fnmatch(case.namespace, p) for p in patterns), (
+                f"{case.id}: expects namespace {case.namespace!r}, which the shipped "
+                f"allowlist does not permit"
+            )
+
+
 class TestCli:
     def test_dry_run_validates_without_calling_anything(
         self, capsys: pytest.CaptureFixture[str]

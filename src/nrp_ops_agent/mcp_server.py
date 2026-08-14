@@ -71,9 +71,7 @@ def _make_handler(name: str, model: type[BaseModel]) -> Any:
 
 def register_all() -> None:
     for name, spec in sorted(registry().items()):
-        mcp.tool(name=name, description=spec.description)(
-            _make_handler(name, spec.input_model)
-        )
+        mcp.tool(name=name, description=spec.description)(_make_handler(name, spec.input_model))
 
 
 def describe() -> str:

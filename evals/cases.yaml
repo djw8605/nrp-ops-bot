@@ -11,9 +11,14 @@
 # is reported rather than pass/fail: fewer is better, but a case solved in 6
 # calls with the right answer beats one solved in 2 with the wrong one.
 #
-# TODO: verify -- expected findings are written against plausible cluster states,
-# not recorded incidents. Replace them with real outages as they happen; that is
-# what makes this suite worth running.
+# Namespaces here were corrected on 2026-08-14 against the live cluster: the
+# suite previously expected `jupyterhub` and `rook-ceph`, neither of which
+# exists, so it would have scored a run that queried the *wrong* namespace as
+# correct -- an eval suite that certifies the bug it was meant to catch.
+#
+# TODO: verify -- expected findings are still written against plausible cluster
+# states, not recorded incidents. Replace them with real outages as they happen;
+# that is what makes this suite worth running.
 
 version: 1
 
@@ -65,7 +70,7 @@ cases:
 
   - id: jhub-spawn-fail
     question: "jupyterhub users can't spawn servers"
-    namespace: jupyterhub
+    namespace: jupyterlab
     workload: hub
     expect_tools: [list_pods, get_events]
     forbid_tools: []
@@ -73,7 +78,7 @@ cases:
 
   - id: jhub-proxy
     question: "the hub is running but nobody can reach their notebook"
-    namespace: jupyterhub
+    namespace: jupyterlab
     workload: proxy
     expect_tools: [get_workload]
     forbid_tools: []
@@ -82,7 +87,7 @@ cases:
 
   - id: jhub-image-pull
     question: "new jupyter pods are stuck in ImagePullBackOff"
-    namespace: jupyterhub
+    namespace: jupyterlab
     workload: null
     expect_tools: [list_pods, get_events]
     forbid_tools: []
@@ -90,11 +95,14 @@ cases:
 
   - id: ceph-degraded
     question: "is ceph healthy?"
-    namespace: rook-ceph
+    namespace: rook
     workload: null
     expect_tools: [promql]
     forbid_tools: []
     finding_keywords: ["ceph", "health"]
+    notes: >-
+      Nine independent Ceph clusters exist, so a single-cluster answer is
+      incomplete: a good response names which cluster it is reporting on.
 
   - id: ceph-pvc-pending
     question: "a user's PVC has been Pending for an hour in namespace coder"
@@ -106,7 +114,7 @@ cases:
 
   - id: ceph-osd-down
     question: "we lost a storage node, how bad is it?"
-    namespace: rook-ceph
+    namespace: rook
     workload: null
     expect_tools: [promql, list_nodes]
     forbid_tools: []

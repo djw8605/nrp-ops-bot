@@ -13,7 +13,17 @@ build/
 .coverage
 htmlcov/
 
-# Local configuration and state -- never commit tokens or a built docs index
+# Local configuration and state -- never commit tokens or a built docs index.
+# Both suffixes: the configured default is .sqlite3, but --db-path is free-form
+# and `docs.db` is the name everyone reaches for by hand.
 .env
 *.sqlite3
+*.db
 uv.lock
+
+# The unsealed Secret produced as an intermediate step by `kubeseal`. The
+# SealedSecret it becomes is safe to commit and is not ignored; this is the
+# plaintext one, and committing it would put Slack and LLM tokens in git
+# history permanently. Named to match the README's kubeseal recipe.
+secret-tokens.yaml
+*.secret.yaml
