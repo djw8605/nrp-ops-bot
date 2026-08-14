@@ -205,6 +205,46 @@ namespaces_denied:  # wins over `namespaces` even on an exact match
   - kube-system
 ```
 
+#### Restricting the bot to specific people
+
+`operators` is the control that does this. It is checked **before** the channel list and applies to
+DMs and channel mentions alike, so a non-operator is refused even inside an allowlisted channel.
+The order in [`authz.py`](src/nrp_ops_agent/authz.py) is: bot message → empty → wrong team →
+**not an operator** → channel/DM → rate limit.
+
+| Message | Allowed when |
+|---|---|
+| `@nrp-ops` in a channel | user ∈ `operators` **and** channel ∈ `channels` |
+| DM to the bot | user ∈ `operators` **and** `NRP_OPS_SLACK_ALLOW_DMS` (default `true`) |
+
+Set `NRP_OPS_SLACK_ALLOW_DMS=false` to force every request into an audited channel.
+
+**Getting the IDs.** The bot cannot look them up — `users:read` and `channels:read` were
+deliberately not requested, so it has no directory access. From the Slack UI:
+
+- **User ID** (`U…`, or `W…` on Enterprise Grid) — click the person → *View full profile* → `…`
+  (More) → *Copy member ID*.
+- **Channel ID** (`C…`, or `G…` for older private channels) — click the channel name → *About* →
+  bottom of the panel. Or copy a message link: it is the `/archives/C…` segment.
+
+Always IDs, never names or emails: display names are mutable, and `SlackEvent` has no field for
+either.
+
+**Two failure modes that look like nothing happening:**
+
+1. **Placeholder IDs behave exactly like an empty list.** The bot connects, logs `authz_deny`, and
+   answers nobody. Shipping with `U00000000000` is a working deployment that ignores everyone.
+2. **Listing a channel does not put the bot in it.** Slack only delivers `app_mention` for channels
+   the bot has joined, so run `/invite @nrp-ops` there too — otherwise the event never arrives and
+   the audit log shows *nothing at all*, not even a denial. That distinction is the fastest way to
+   tell the two apart: a denial means the allowlist; silence means the bot is not in the channel.
+
+Editing is a `kubectl apply`, not a redeploy — the loader watches mtime. Allow up to a minute for
+kubelet to project the updated ConfigMap into the pod.
+
+Each operator gets `NRP_OPS_RATE_LIMIT_PER_HOUR` (default 10) investigations per hour, tracked per
+user ID.
+
 ---
 
 ## Audit schema

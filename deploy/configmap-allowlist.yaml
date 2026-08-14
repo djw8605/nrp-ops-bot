@@ -14,13 +14,35 @@ metadata:
     app.kubernetes.io/name: nrp-ops-agent
 data:
   allowlist.yaml: |
+    # WHO the bot answers. This is the check that decides "specific people":
+    # it runs before the channel check and applies to DMs and channels alike, so
+    # a non-operator is refused even in an allowlisted channel.
+    #
     # Slack user IDs only (U.../W...). Never display names or emails -- users can
-    # change those at will. Find an ID in Slack: profile -> ... -> Copy member ID.
+    # change those at will, and authz.SlackEvent has no field for either.
+    # Get one: click the person in Slack -> View full profile -> ... (More)
+    # -> Copy member ID.
+    #
+    # An empty list denies everyone. So does a list of placeholders, which looks
+    # identical from the outside: the bot connects, logs authz_deny, and answers
+    # nobody.
     operators:
       - U00000000000  # TODO: replace with real operator IDs before deploying
 
-    # Slack channel IDs (C.../G...) where @mentions are honoured. DMs from an
-    # allowlisted operator are governed by NRP_OPS_SLACK_ALLOW_DMS instead.
+    # WHERE @mentions are honoured, as a second gate on top of `operators`.
+    # A channel mention needs BOTH: an allowlisted user in an allowlisted
+    # channel. DMs skip this list and are governed by NRP_OPS_SLACK_ALLOW_DMS
+    # (default true) -- they are still restricted to `operators`.
+    #
+    # Slack channel IDs (C.../G...), not names: names are mutable and #ops in
+    # one workspace is not #ops in another. Get one from the channel header ->
+    # the channel name -> About, at the bottom; or from a copied message link,
+    # where it is the /archives/C... segment.
+    #
+    # Listing a channel does NOT put the bot in it. Slack only delivers
+    # app_mention events for channels the bot has joined, so also run
+    # `/invite @nrp-ops` there -- otherwise the mention never arrives and the
+    # audit log shows nothing at all, not even a denial.
     channels:
       - C00000000000  # TODO: replace with the ops channel ID
 
