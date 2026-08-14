@@ -1,0 +1,83 @@
+---
+# Rebuilds the documentation FTS5 index every 6 hours onto the shared PVC.
+#
+# The build is atomic: chunks go into <db>.building and the file is renamed over
+# the live index only on success, so the agent never reads a half-built database.
+# A checkout that yields zero chunks is treated as a failure and the previous
+# index is kept -- a docs repo outage must not silently empty the index.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nrp-ops-agent-docs-sync
+  namespace: nrp-ops-agent
+  labels:
+    app.kubernetes.io/name: nrp-ops-agent
+    app.kubernetes.io/component: docs-sync
+spec:
+  schedule: "17 */6 * * *"  # offset from the hour to avoid the cluster-wide cron spike
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: nrp-ops-agent
+            app.kubernetes.io/component: docs-sync
+        spec:
+          restartPolicy: OnFailure
+          # No ServiceAccount token: this job talks to GitLab and the PVC only,
+          # and has no business reaching the Kubernetes API.
+          automountServiceAccountToken: false
+          serviceAccountName: default
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: docs-sync
+              image: ghcr.io/nrp/nrp-ops-agent:0.1.0  # TODO: replace with your registry
+              args: ["nrp-ops-docs-sync"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: NRP_OPS_DOCS_REPO_URL
+                  value: https://gitlab.nrp-nautilus.io/prp/nrp-site.git
+                - name: NRP_OPS_DOCS_DB_PATH
+                  value: /var/lib/nrp-ops-agent/docs.sqlite3
+                - name: NRP_OPS_DOCS_SITE_BASE_URL
+                  value: https://nrp.ai
+                - name: NRP_OPS_AUDIT_STREAM
+                  value: stdout
+                # git clone needs somewhere to write under a read-only rootfs.
+                - name: TMPDIR
+                  value: /tmp
+              volumeMounts:
+                - name: docs
+                  mountPath: /var/lib/nrp-ops-agent
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+          volumes:
+            - name: docs
+              persistentVolumeClaim:
+                claimName: nrp-ops-agent-docs
+            - name: tmp
+              emptyDir:
+                sizeLimit: 2Gi

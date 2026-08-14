@@ -1,0 +1,86 @@
+---
+# Read-only cluster role for nrp-ops-agent.
+#
+# ============================ SECURITY INVARIANT ============================
+# Phase 1 is strictly read-only. This role grants `get`, `list` and `watch` and
+# NOTHING else. There is deliberately no `create`, `update`, `patch`, `delete`
+# or `deletecollection` verb anywhere in this file, on any resource.
+#
+# The following are ABSENT ON PURPOSE. Do not add them "just to debug something":
+#
+#   secrets                 The agent must not be able to read credentials. Note
+#                           that this alone is insufficient -- pods/log is also
+#                           an exfiltration channel, because applications log
+#                           their own credentials. See src/nrp_ops_agent/redact.py.
+#   configmaps              ConfigMaps routinely carry credentials that someone
+#                           assumed were private, and their contents are
+#                           attacker-writable prompt-injection surface. There is
+#                           no ConfigMap tool in the codebase either.
+#   pods/exec               Would be arbitrary code execution inside a workload.
+#   pods/attach             Same, plus access to an interactive session.
+#   pods/portforward        Would turn the agent into a network pivot into any
+#                           namespace it can read.
+#   serviceaccounts/token   Would let the agent mint tokens and escalate beyond
+#                           this role entirely.
+#
+# Enforcement is here in RBAC and again in code (typed tools, no kubectl or
+# shell passthrough). Neither layer relies on the language model choosing not to
+# do something.
+#
+# Verified by tests/test_rbac.py, which parses this file and asserts every claim
+# above, and by tests/test_tools_k8s.py, which asserts no tool can reach a
+# resource this role does not grant.
+# ===========================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nrp-ops-agent-read
+  labels:
+    app.kubernetes.io/name: nrp-ops-agent
+    app.kubernetes.io/component: rbac
+rules:
+  # Core read-only diagnostics. `pods/log` is a subresource of `pods` and is
+  # named explicitly so that its presence is an auditable decision.
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/status
+      - events
+      - nodes
+      - nodes/status
+      - services
+      - endpoints
+      - persistentvolumeclaims
+      - namespaces
+    verbs: ["get", "list", "watch"]
+
+  # Workload replica health.
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - deployments/status
+      - statefulsets
+      - statefulsets/status
+      - daemonsets
+      - daemonsets/status
+      - replicasets
+      - replicasets/status
+    verbs: ["get", "list", "watch"]
+
+  # Ingress objects explain "the service is up but users get a 503".
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+    verbs: ["get", "list", "watch"]
+
+  # Modern events API; the core/v1 events above are the legacy one.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+  # Pod-level resource usage, for "is it OOM-looping or just slow".
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]

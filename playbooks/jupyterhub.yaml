@@ -1,0 +1,41 @@
+# JupyterHub. Reports are usually "the hub won't spawn my server", which is a
+# proxy/hub split-brain, an image pull failure, or a PVC that will not bind.
+service: jupyterhub
+match: ["jupyterhub", "jupyter", "hub", "notebook", "jhub", "spawn"]
+namespaces: ["jupyterhub", "jhub-*"]
+docs_hints:
+  - "admindocs/cluster"
+  - "userdocs/jupyterhub"
+steps:
+  - name: hub workload
+    tool: get_workload
+    args: {kind: deployment, namespace: jupyterhub, name: hub}
+    note: "TODO: verify the release name; z2jh names it <release>-hub in some installs."
+
+  - name: proxy workload
+    tool: get_workload
+    args: {kind: deployment, namespace: jupyterhub, name: proxy}
+    note: >-
+      A healthy hub behind a dead proxy looks exactly like "the hub is down" to
+      users. TODO: verify name (proxy vs autohttps).
+
+  - name: pods including singleuser servers
+    tool: list_pods
+    args: {namespace: jupyterhub}
+    note: jupyter-<username> pods Pending means spawn is blocked, not the hub.
+
+  - name: spawn failures in events
+    tool: get_events
+    args: {namespace: jupyterhub, since_seconds: 3600}
+    note: Look for FailedScheduling, FailedMount, ImagePullBackOff.
+
+  - name: hub logs
+    tool: get_logs
+    args: {namespace: jupyterhub, pod: hub-0, tail_lines: 200}
+    note: >-
+      TODO: verify pod name from list_pods first rather than assuming hub-0.
+      Spawn timeouts are logged here with the username.
+
+  - name: runbook
+    tool: search_docs
+    args: {query: "jupyterhub spawn failure", section: admindocs}

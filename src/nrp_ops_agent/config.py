@@ -90,9 +90,12 @@ class Settings(BaseSettings):
     kube_request_timeout_s: float = Field(default=15.0, gt=0, le=120)
 
     # ------------------------------------------------------------ Prometheus --
-    # TODO: verify -- this is the well-known NRP Thanos hostname but has not been
-    # confirmed against the live cluster, and it is unknown whether it requires a
-    # bearer token. Override with NRP_OPS_PROMETHEUS_BASE_URL.
+    # NRP runs both thanos.nrp-nautilus.io and prometheus.nrp-nautilus.io. Thanos is
+    # the default because it fronts Prometheus with longer retention, which is what
+    # "was this broken yesterday too?" questions need; point this at the plain
+    # Prometheus if you want the freshest scrape instead. Both hosts are permitted
+    # egress in deploy/networkpolicy.yaml.
+    # TODO: verify -- unknown whether either endpoint requires a bearer token.
     prometheus_base_url: str = Field(default="https://thanos.nrp-nautilus.io")
     prometheus_bearer_token: SecretStr | None = Field(
         default=None, description="Omit for an unauthenticated endpoint."
@@ -103,10 +106,11 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------- LLM --
-    # TODO: verify -- NRP hosts an OpenAI-compatible vLLM gateway; confirm the exact
-    # base URL. NRP_OPS_LLM_MODEL has no default on purpose: pointing at the wrong
-    # model silently is worse than failing to start.
-    llm_base_url: str = Field(default="https://llm.nrp-nautilus.io/v1")
+    # NRP's OpenAI-compatible gateway. NRP_OPS_LLM_MODEL has no default on purpose:
+    # pointing at the wrong model silently is worse than failing to start, and the
+    # gateway serves several. List them with GET {llm_base_url}/models.
+    # TODO: verify -- the /v1 path suffix and whether the gateway requires a key.
+    llm_base_url: str = Field(default="https://ellm.nrp-nautilus.io/v1")
     llm_api_key: SecretStr = Field(default=SecretStr(""))
     llm_model: str = Field(default="")
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)

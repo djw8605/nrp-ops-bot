@@ -1,0 +1,12 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nrp-ops-agent
+  labels:
+    app.kubernetes.io/name: nrp-ops-agent
+    # The agent holds no privileged capability; restricted is the correct tier
+    # and makes the deployment fail loudly if that ever stops being true.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

@@ -1,0 +1,109 @@
+---
+# Egress allowlist. Without this the agent could reach anything on the cluster
+# network and anything on the internet, which turns a prompt injection in a pod
+# log from "cannot do anything useful" into "can try to exfiltrate to a host of
+# the attacker's choosing".
+#
+# There is no ingress rule at all: Socket Mode means Slack connects outbound
+# from this pod, so nothing ever needs to reach it.
+#
+# TODO: verify the CIDRs and ports below against this cluster -- the API server
+# endpoint, the Thanos/Prometheus address and the LLM gateway address all depend
+# on how NRP is wired, and a too-narrow policy fails as a confusing timeout.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nrp-ops-agent-egress
+  namespace: nrp-ops-agent
+  labels:
+    app.kubernetes.io/name: nrp-ops-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nrp-ops-agent
+  policyTypes:
+    - Ingress
+    - Egress
+
+  # Deny all inbound. The empty ingress list is the deny.
+  ingress: []
+
+  egress:
+    # DNS. Without this every other rule below fails at name resolution.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Kubernetes API server. Cluster-internal ClusterIP for the default service.
+    - to:
+        - ipBlock:
+            cidr: 10.43.0.1/32  # TODO: verify -- `kubectl get svc kubernetes -o wide`
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # Prometheus / Thanos, the LLM gateway, and Slack. These resolve to public
+    # addresses, so they are expressed as an internet block minus RFC1918 rather
+    # than as hostnames, which NetworkPolicy cannot express.
+    #
+    # This is the weakest rule here: it permits any public HTTPS destination.
+    # Narrow it to the resolved addresses of thanos.nrp-nautilus.io,
+    # prometheus.nrp-nautilus.io, ellm.nrp-nautilus.io, slack.com and
+    # wss-primary.slack.com if your CNI supports FQDN policies (Cilium does);
+    # see the CiliumNetworkPolicy sketch at the bottom of this file.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16  # link-local, incl. cloud metadata endpoints
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Preferred form where Cilium is the CNI: name the hosts instead of the CIDRs.
+# Apply this INSTEAD OF the public-egress rule above, not in addition to it.
+#
+# apiVersion: cilium.io/v2
+# kind: CiliumNetworkPolicy
+# metadata:
+#   name: nrp-ops-agent-egress-fqdn
+#   namespace: nrp-ops-agent
+# spec:
+#   endpointSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: nrp-ops-agent
+#   egress:
+#     - toFQDNs:
+#         - matchName: thanos.nrp-nautilus.io
+#         - matchName: prometheus.nrp-nautilus.io
+#         - matchName: ellm.nrp-nautilus.io
+#         - matchName: slack.com
+#         - matchPattern: "*.slack.com"
+#         - matchName: gitlab.nrp-nautilus.io   # docs-sync CronJob only
+#       toPorts:
+#         - ports:
+#             - port: "443"
+#               protocol: TCP
+#     - toEndpoints:
+#         - matchLabels:
+#             io.kubernetes.pod.namespace: kube-system
+#             k8s-app: kube-dns
+#       toPorts:
+#         - ports:
+#             - port: "53"
+#               protocol: UDP
+#           rules:
+#             dns:
+#               - matchPattern: "*"

@@ -1,0 +1,19 @@
+---
+# Binds the read-only role cluster-wide. Cluster scope is required because the
+# agent must read nodes and must reach whichever namespace an operator asks
+# about; the actual restriction on which namespaces are readable is enforced by
+# the namespace allowlist in configmap-allowlist.yaml, checked inside every tool.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nrp-ops-agent-read
+  labels:
+    app.kubernetes.io/name: nrp-ops-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nrp-ops-agent-read
+subjects:
+  - kind: ServiceAccount
+    name: nrp-ops-agent
+    namespace: nrp-ops-agent

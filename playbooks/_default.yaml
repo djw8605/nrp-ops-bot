@@ -1,0 +1,26 @@
+# Fallback when no service keyword matches. Deliberately generic and cheap: find
+# out what the operator is actually talking about before spending tool calls.
+service: _default
+match: []
+namespaces: []
+docs_hints: []
+steps:
+  - name: find the documented owner of this component
+    tool: search_docs
+    args: {query: "<the component the operator named>"}
+    note: >-
+      Do this first when the namespace is not obvious. The docs usually name the
+      namespace, which every other tool then needs.
+
+  - name: pods in the suspected namespace
+    tool: list_pods
+    args: {namespace: "<namespace>"}
+
+  - name: recent events there
+    tool: get_events
+    args: {namespace: "<namespace>", since_seconds: 3600}
+
+  - name: cluster-wide node health
+    tool: list_nodes
+    args: {only_unhealthy: true}
+    note: Rules out "everything is broken" before investigating one service.

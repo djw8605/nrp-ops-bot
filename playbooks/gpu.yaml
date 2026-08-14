@@ -1,0 +1,42 @@
+# GPU scheduling and health. "My job won't start" is far more often exhausted
+# capacity than a broken driver, so capacity is checked before device health.
+service: gpu
+match: ["gpu", "cuda", "nvidia", "a100", "h100", "v100", "mig", "device plugin"]
+namespaces: ["gpu-operator", "nvidia-device-plugin"]
+docs_hints:
+  - "userdocs/running/gpu"
+  - "admindocs/cluster"
+steps:
+  - name: allocatable vs requested GPUs
+    tool: promql
+    args:
+      query: 'sum(kube_node_status_allocatable{resource="nvidia_com_gpu"}) - sum(kube_pod_resource_requests{resource="nvidia_com_gpu"})'
+    note: >-
+      TODO: verify against live Prometheus; metric names differ between
+      kube-state-metrics versions. A value near zero means the cluster is simply
+      full and the answer is "wait or use a different GPU type".
+
+  - name: unschedulable pods cluster-wide
+    tool: promql
+    args:
+      query: 'sum(kube_pod_status_unschedulable)'
+    note: "TODO: verify against live Prometheus."
+
+  - name: device plugin daemonset
+    tool: get_workload
+    args: {kind: daemonset, namespace: gpu-operator, name: nvidia-device-plugin-daemonset}
+    note: >-
+      TODO: verify namespace and name. desired != ready means some nodes have no
+      working GPU plugin and will never schedule GPU pods.
+
+  - name: nodes reporting problems
+    tool: list_nodes
+    args: {only_unhealthy: true}
+
+  - name: gpu-operator events
+    tool: get_events
+    args: {namespace: gpu-operator, since_seconds: 3600}
+
+  - name: runbook
+    tool: search_docs
+    args: {query: "requesting gpu nvidia.com/gpu pending", section: userdocs}

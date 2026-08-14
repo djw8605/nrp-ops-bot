@@ -1,0 +1,53 @@
+# Coder (code-server workspaces). The most common report is "coder is not
+# responding", which is almost always one of: the deployment has no ready
+# replicas, the ingress is returning 5xx while pods are healthy, or workspace
+# pods cannot schedule for want of GPU/CPU.
+service: coder
+match: ["coder", "code-server", "workspace", "workspaces"]
+namespaces: ["coder"]
+docs_hints:
+  - "admindocs/upgrades/coder"
+  - "userdocs/coder/deploy"
+steps:
+  - name: workload health
+    tool: get_workload
+    args: {kind: deployment, namespace: coder, name: coder}
+    note: >-
+      ready < desired means the control plane itself is down for users.
+      generation != observedGeneration means a rollout is stuck.
+
+  - name: pod restarts and states
+    tool: list_pods
+    args: {namespace: coder}
+    note: CrashLoopBackOff here points at the pod; Pending points at scheduling.
+
+  - name: ingress error rate
+    tool: promql
+    args:
+      query: 'sum(rate(nginx_ingress_controller_requests{exported_namespace="coder",status=~"5.."}[5m]))'
+    note: >-
+      TODO: verify against live Prometheus. Non-zero with healthy pods means the
+      failure is between the ingress and the service, not in coder itself.
+
+  - name: ingress request rate baseline
+    tool: promql
+    args:
+      query: 'sum(rate(nginx_ingress_controller_requests{exported_namespace="coder"}[5m]))'
+      lookback: 6h
+      step: 5m
+    note: >-
+      TODO: verify against live Prometheus. A rate that fell to zero means users
+      stopped reaching the ingress at all -- look at DNS/LB, not at coder.
+
+  - name: recent events
+    tool: get_events
+    args: {namespace: coder, since_seconds: 3600}
+
+  - name: node conditions
+    tool: list_nodes
+    args: {only_unhealthy: true}
+    note: Only relevant if pods are Pending or were evicted.
+
+  - name: runbook
+    tool: search_docs
+    args: {query: "coder deployment upgrade rollback", section: admindocs}

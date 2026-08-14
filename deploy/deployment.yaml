@@ -1,0 +1,117 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nrp-ops-agent
+  namespace: nrp-ops-agent
+  labels:
+    app.kubernetes.io/name: nrp-ops-agent
+spec:
+  # Exactly one. Socket Mode delivers each event to a single connection, but two
+  # replicas would each open one and both would answer the same mention.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nrp-ops-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nrp-ops-agent
+    spec:
+      serviceAccountName: nrp-ops-agent
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/nrp/nrp-ops-agent:0.1.0  # TODO: replace with your registry
+          imagePullPolicy: IfNotPresent
+          args: ["nrp-ops-agent"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            # Slack and LLM credentials. Create with:
+            #   kubectl -n nrp-ops-agent create secret generic nrp-ops-agent-tokens \
+            #     --from-literal=NRP_OPS_SLACK_BOT_TOKEN=xoxb-... \
+            #     --from-literal=NRP_OPS_SLACK_APP_TOKEN=xapp-... \
+            #     --from-literal=NRP_OPS_LLM_API_KEY=...
+            - secretRef:
+                name: nrp-ops-agent-tokens
+          env:
+            - name: NRP_OPS_SLACK_TEAM_ID
+              value: "T00000000000"  # TODO: replace with the NRP workspace team ID
+            - name: NRP_OPS_ALLOWLIST_PATH
+              value: /etc/nrp-ops-agent/allowlist.yaml
+            - name: NRP_OPS_KUBE_MODE
+              value: incluster
+            - name: NRP_OPS_PROMETHEUS_BASE_URL
+              value: https://thanos.nrp-nautilus.io
+            - name: NRP_OPS_LLM_BASE_URL
+              value: https://ellm.nrp-nautilus.io/v1
+            - name: NRP_OPS_LLM_MODEL
+              value: ""  # TODO: required -- the pod refuses to start while empty
+            - name: NRP_OPS_DOCS_DB_PATH
+              value: /var/lib/nrp-ops-agent/docs.sqlite3
+            - name: NRP_OPS_AUDIT_STREAM
+              value: stdout
+            - name: NRP_OPS_RATE_LIMIT_PER_HOUR
+              value: "10"
+          volumeMounts:
+            - name: allowlist
+              mountPath: /etc/nrp-ops-agent
+              readOnly: true
+            - name: docs
+              mountPath: /var/lib/nrp-ops-agent
+              readOnly: true
+            # readOnlyRootFilesystem means anything that writes needs an explicit
+            # mount. These are the only two paths that do.
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import nrp_ops_agent"]
+            initialDelaySeconds: 15
+            periodSeconds: 60
+      volumes:
+        - name: allowlist
+          configMap:
+            name: nrp-ops-agent-allowlist
+        - name: docs
+          persistentVolumeClaim:
+            claimName: nrp-ops-agent-docs
+            readOnly: true
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nrp-ops-agent-docs
+  namespace: nrp-ops-agent
+  labels:
+    app.kubernetes.io/name: nrp-ops-agent
+spec:
+  accessModes: ["ReadWriteMany"]  # the CronJob writes while the agent reads
+  resources:
+    requests:
+      storage: 1Gi
+  # TODO: verify the storage class name on this cluster.
+  storageClassName: rook-cephfs

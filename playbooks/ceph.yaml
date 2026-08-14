@@ -1,0 +1,48 @@
+# Rook/Ceph storage. Symptoms reach operators as "my pod is stuck ContainerCreating"
+# or "writes are hanging", both of which are storage rather than the workload.
+service: ceph
+match: ["ceph", "rook", "storage", "pvc", "volume", "cephfs", "rbd", "s3"]
+namespaces: ["rook-ceph"]
+docs_hints:
+  - "admindocs/storage"
+  - "userdocs/storage"
+steps:
+  - name: ceph health
+    tool: promql
+    args:
+      query: 'ceph_health_status'
+    note: >-
+      TODO: verify against live Prometheus (requires the Ceph mgr prometheus
+      module). 0 = HEALTH_OK, 1 = HEALTH_WARN, 2 = HEALTH_ERR.
+
+  - name: osds down
+    tool: promql
+    args:
+      query: 'count(ceph_osd_up == 0)'
+    note: "TODO: verify against live Prometheus."
+
+  - name: pool fullness
+    tool: promql
+    args:
+      query: 'topk(5, ceph_pool_percent_used)'
+    note: >-
+      TODO: verify against live Prometheus. A pool near full makes writes hang
+      rather than fail, which is why users report "slow" not "broken".
+
+  - name: rook-ceph pods
+    tool: list_pods
+    args: {namespace: rook-ceph}
+    note: mon quorum needs a majority of rook-ceph-mon-* Running.
+
+  - name: manager health
+    tool: get_workload
+    args: {kind: deployment, namespace: rook-ceph, name: rook-ceph-mgr-a}
+    note: "TODO: verify the mgr deployment name in this cluster."
+
+  - name: storage events
+    tool: get_events
+    args: {namespace: rook-ceph, since_seconds: 3600}
+
+  - name: runbook
+    tool: search_docs
+    args: {query: "ceph pvc pending troubleshooting", section: admindocs}

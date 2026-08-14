@@ -1,0 +1,44 @@
+---
+# Hot-reloaded policy. The agent watches this file's mtime and re-reads it, so
+# adding an operator is `kubectl apply`, not a redeploy.
+#
+# A corrupt edit is not fail-open: the running agent keeps the last policy it
+# successfully validated, and a fresh pod that cannot parse this file starts
+# with an empty (deny-everything) policy.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nrp-ops-agent-allowlist
+  namespace: nrp-ops-agent
+  labels:
+    app.kubernetes.io/name: nrp-ops-agent
+data:
+  allowlist.yaml: |
+    # Slack user IDs only (U.../W...). Never display names or emails -- users can
+    # change those at will. Find an ID in Slack: profile -> ... -> Copy member ID.
+    operators:
+      - U00000000000  # TODO: replace with real operator IDs before deploying
+
+    # Slack channel IDs (C.../G...) where @mentions are honoured. DMs from an
+    # allowlisted operator are governed by NRP_OPS_SLACK_ALLOW_DMS instead.
+    channels:
+      - C00000000000  # TODO: replace with the ops channel ID
+
+    # fnmatch globs. Deny-by-default: a namespace matching nothing here is
+    # refused inside the tool, before any API call is made.
+    namespaces:
+      - coder
+      - jupyterhub
+      - "jhub-*"
+      - rook-ceph
+      - gpu-operator
+      - nvidia-device-plugin
+
+    # Wins over `namespaces` even on an exact match. Keep the control plane and
+    # anything holding cluster-wide credentials out of reach of pod logs.
+    namespaces_denied:
+      - kube-system
+      - kube-public
+      - kube-node-lease
+      - cert-manager
+      - nrp-ops-agent
