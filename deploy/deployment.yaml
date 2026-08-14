@@ -30,7 +30,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: agent
-          image: ghcr.io/nrp/nrp-ops-agent:0.1.0  # TODO: replace with your registry
+          # Placeholder. deploy/kustomization.yaml rewrites this to the real
+          # registry and tag; the CI bump job edits it there, never here.
+          image: ghcr.io/nrp/nrp-ops-agent:0.1.0
           imagePullPolicy: IfNotPresent
           args: ["nrp-ops-agent"]
           securityContext:
@@ -113,5 +115,8 @@ spec:
   resources:
     requests:
       storage: 1Gi
-  # TODO: verify the storage class name on this cluster.
-  storageClassName: rook-cephfs
+  # Verified 2026-08-14 against the live cluster: the RWX CephFS class is called
+  # `cephfs` (provisioner rook-ceph.cephfs.csi.ceph.com). There is no
+  # `rook-cephfs` class, so the previous value would have left the PVC Pending
+  # forever and the agent stuck without a docs index.
+  storageClassName: cephfs

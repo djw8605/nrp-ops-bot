@@ -2,32 +2,44 @@
 # capacity than a broken driver, so capacity is checked before device health.
 service: gpu
 match: ["gpu", "cuda", "nvidia", "a100", "h100", "v100", "mig", "device plugin"]
-namespaces: ["gpu-operator", "nvidia-device-plugin"]
+# Verified 2026-08-14: `gpu-operator` holds the whole GPU stack, including the
+# device plugin. There is no `nvidia-device-plugin` namespace on this cluster.
+namespaces: ["gpu-operator"]
 docs_hints:
-  - "userdocs/running/gpu"
-  - "admindocs/cluster"
+  - "userdocs/running/gpu-pods"
+  - "userdocs/tutorial/scheduling"
+  - "admindocs/cluster/mig-gpus"
 steps:
   - name: allocatable vs requested GPUs
     tool: promql
     args:
-      query: 'sum(kube_node_status_allocatable{resource="nvidia_com_gpu"}) - sum(kube_pod_resource_requests{resource="nvidia_com_gpu"})'
+      query: 'sum(kube_node_status_allocatable{resource="nvidia_com_gpu"}) - sum(kube_pod_container_resource_requests{resource="nvidia_com_gpu"} * on (namespace,pod) group_left() (kube_pod_status_phase{phase="Running"} == 1))'
     note: >-
-      TODO: verify against live Prometheus; metric names differ between
-      kube-state-metrics versions. A value near zero means the cluster is simply
-      full and the answer is "wait or use a different GPU type".
+      Verified against live Thanos. Two traps, both of which produced a wrong
+      answer before: the metric is kube_pod_container_resource_requests (there
+      is no kube_pod_resource_requests, so the query silently returned nothing),
+      and it must be restricted to Running pods -- counting Pending ones scored
+      2168 requests against 1133 allocatable and reported *negative* free GPUs.
+      The Running-only form gives 674 used of 1133. A value near zero means the
+      cluster is simply full and the answer is "wait or use a different GPU
+      type". `nvidia_com_gpu` is the generic pool; high-memory cards are counted
+      separately under `nvidia_com_h100`.
 
   - name: unschedulable pods cluster-wide
     tool: promql
     args:
       query: 'sum(kube_pod_status_unschedulable)'
-    note: "TODO: verify against live Prometheus."
+    note: >-
+      Verified against live Thanos. Runs in the high hundreds on this cluster
+      even when healthy -- NRP is chronically oversubscribed, so treat this as a
+      trend, not an alarm.
 
   - name: device plugin daemonset
     tool: get_workload
     args: {kind: daemonset, namespace: gpu-operator, name: nvidia-device-plugin-daemonset}
     note: >-
-      TODO: verify namespace and name. desired != ready means some nodes have no
-      working GPU plugin and will never schedule GPU pods.
+      Verified: this namespace and daemonset both exist. desired != ready means
+      some nodes have no working GPU plugin and will never schedule GPU pods.
 
   - name: nodes reporting problems
     tool: list_nodes

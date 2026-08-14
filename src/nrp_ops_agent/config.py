@@ -95,7 +95,12 @@ class Settings(BaseSettings):
     # "was this broken yesterday too?" questions need; point this at the plain
     # Prometheus if you want the freshest scrape instead. Both hosts are permitted
     # egress in deploy/networkpolicy.yaml.
-    # TODO: verify -- unknown whether either endpoint requires a bearer token.
+    # Verified 2026-08-14 from outside the cluster: both hosts answer
+    # /api/v1/query with HTTP 200 and no credentials, so the bearer token below
+    # stays unset by default. Note Thanos fans in every NRP cluster at once --
+    # `ceph_health_status` alone returns nine series, one per Ceph cluster -- so
+    # aggregate without a `by (namespace)` and you get a number that describes
+    # no single cluster.
     prometheus_base_url: str = Field(default="https://thanos.nrp-nautilus.io")
     prometheus_bearer_token: SecretStr | None = Field(
         default=None, description="Omit for an unauthenticated endpoint."
@@ -109,7 +114,16 @@ class Settings(BaseSettings):
     # NRP's OpenAI-compatible gateway. NRP_OPS_LLM_MODEL has no default on purpose:
     # pointing at the wrong model silently is worse than failing to start, and the
     # gateway serves several. List them with GET {llm_base_url}/models.
-    # TODO: verify -- the /v1 path suffix and whether the gateway requires a key.
+    # Verified 2026-08-14: GET https://ellm.nrp-nautilus.io/v1/models returns 200
+    # unauthenticated and lists 14 models, which confirms the /v1 suffix. POST to
+    # /v1/chat/completions is refused with 403 from outside the cluster, so a key
+    # (or in-cluster origin) is required -- llm_api_key is not optional in
+    # practice. TODO: verify from inside the cluster that the chosen model
+    # actually emits OpenAI-style tool_calls; the agent loop depends on it and it
+    # could not be exercised from outside. Models offered at time of writing:
+    # qwen3, qwen3-small, qwen3-4bit, gpt-oss, gemma, gemma-small, gemma-small-e4b,
+    # gemma4-small, gemma4-12b, kimi, minimax-m2, deepseek-v4-flash, glm-5,
+    # plus qwen3-embedding (embeddings only -- not a chat model).
     llm_base_url: str = Field(default="https://ellm.nrp-nautilus.io/v1")
     llm_api_key: SecretStr = Field(default=SecretStr(""))
     llm_model: str = Field(default="")

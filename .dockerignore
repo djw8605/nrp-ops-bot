@@ -1,0 +1,21 @@
+# Keep the build context small and, more importantly, keep local state out of
+# the image. .venv in particular holds absolute host paths that would shadow
+# /opt/venv if it were ever copied in.
+.git
+.github
+.venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+**/__pycache__
+*.pyc
+*.egg-info
+dist
+build
+
+# Not needed at runtime; the image is not a dev environment.
+tests
+evals
+deploy
+*.sqlite3
+.env

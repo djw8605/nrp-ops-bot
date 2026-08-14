@@ -1,40 +1,56 @@
 # JupyterHub. Reports are usually "the hub won't spawn my server", which is a
 # proxy/hub split-brain, an image pull failure, or a PVC that will not bind.
+#
+# Verified 2026-08-14 against live kube-state-metrics. The namespace is
+# `jupyterlab` (and `jupyterlab-east`), NOT `jupyterhub` -- there is no
+# `jupyterhub` namespace and no `jhub-*` namespace on this cluster, so the
+# previous version of this playbook could not have read anything at all.
 service: jupyterhub
-match: ["jupyterhub", "jupyter", "hub", "notebook", "jhub", "spawn"]
-namespaces: ["jupyterhub", "jhub-*"]
+match: ["jupyterhub", "jupyter", "hub", "notebook", "jhub", "spawn", "jupyterlab"]
+namespaces: ["jupyterlab", "jupyterlab-east"]
 docs_hints:
-  - "admindocs/cluster"
-  - "userdocs/jupyterhub"
+  - "userdocs/jupyter/jupyterhub"
+  - "userdocs/jupyter/jupyter-pod"
+  - "admindocs/cluster/jupyterlab-admin"
+  - "admindocs/upgrades/jupyterhub"
 steps:
   - name: hub workload
     tool: get_workload
-    args: {kind: deployment, namespace: jupyterhub, name: hub}
-    note: "TODO: verify the release name; z2jh names it <release>-hub in some installs."
+    args: {kind: deployment, namespace: jupyterlab, name: hub}
+    note: >-
+      Verified: the deployment is plainly `hub` (not `<release>-hub`), in
+      namespace `jupyterlab`. There is a second install in `jupyterlab-east`
+      with the same deployment names -- confirm which one the user means before
+      answering, because a healthy hub in one says nothing about the other.
 
   - name: proxy workload
     tool: get_workload
-    args: {kind: deployment, namespace: jupyterhub, name: proxy}
+    args: {kind: deployment, namespace: jupyterlab, name: proxy}
     note: >-
-      A healthy hub behind a dead proxy looks exactly like "the hub is down" to
-      users. TODO: verify name (proxy vs autohttps).
+      Verified: deployment `proxy` exists alongside `hub`. A healthy hub behind
+      a dead proxy looks exactly like "the hub is down" to users.
 
   - name: pods including singleuser servers
     tool: list_pods
-    args: {namespace: jupyterhub}
-    note: jupyter-<username> pods Pending means spawn is blocked, not the hub.
+    args: {namespace: jupyterlab}
+    note: >-
+      Singleuser pods are named from the escaped email, not a bare username:
+      jupyter-jic128-40ucsd-2eedu is jic128@ucsd.edu (-40 is @, -2e is .).
+      Decode it before quoting a pod name back to an operator. Pending means
+      spawn is blocked, not that the hub is down.
 
   - name: spawn failures in events
     tool: get_events
-    args: {namespace: jupyterhub, since_seconds: 3600}
+    args: {namespace: jupyterlab, since_seconds: 3600}
     note: Look for FailedScheduling, FailedMount, ImagePullBackOff.
 
   - name: hub logs
     tool: get_logs
-    args: {namespace: jupyterhub, pod: hub-0, tail_lines: 200}
+    args: {namespace: jupyterlab, pod: "<hub pod name from list_pods>", tail_lines: 200}
     note: >-
-      TODO: verify pod name from list_pods first rather than assuming hub-0.
-      Spawn timeouts are logged here with the username.
+      Take the pod name from list_pods rather than assuming `hub-0`: the hub is
+      a Deployment here, so its pod carries a generated suffix. Spawn timeouts
+      are logged here with the username.
 
   - name: runbook
     tool: search_docs

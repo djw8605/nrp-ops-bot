@@ -1,0 +1,49 @@
+---
+# ArgoCD renders this directory. The application source and its manifests share
+# one repository, so a code change and the deployment that carries it land in
+# the same history.
+#
+# There is deliberately no Namespace resource here. The namespace is created and
+# owned outside this Application (ArgoCD's destination, or a cluster admin).
+#
+#   NOTE: the Namespace this repo used to ship carried the Pod Security
+#   Standards labels
+#       pod-security.kubernetes.io/enforce: restricted
+#       pod-security.kubernetes.io/audit:   restricted
+#       pod-security.kubernetes.io/warn:    restricted
+#   Those are NOT set by anything in this directory any more. The workloads
+#   still satisfy `restricted`, but nothing here enforces that they continue to.
+#   Whoever creates the namespace should carry those labels across; otherwise a
+#   future manifest can quietly relax the security context and still deploy.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nrp-ops-agent
+
+# No `commonLabels` / `labels` here on purpose. Every manifest already carries
+# app.kubernetes.io/name, and kustomize's label transformer also rewrites label
+# *selectors*: it appended app.kubernetes.io/name to the kube-dns podSelector in
+# networkpolicy.yaml, producing a rule that matches pods which are both kube-dns
+# and this agent -- that is, nothing. DNS egress would have been silently denied.
+resources:
+  - serviceaccount.yaml
+  - clusterrole.yaml
+  - clusterrolebinding.yaml
+  - configmap-allowlist.yaml
+  - deployment.yaml
+  - cronjob-docs-sync.yaml
+  - networkpolicy.yaml
+  # Uncomment once you have generated it -- see "Secrets" in the README. It is
+  # not listed by default because kustomize fails hard on a missing resource,
+  # and the file cannot be committed until someone runs kubeseal against this
+  # cluster. A SealedSecret is safe to commit; a Secret is not.
+  # - sealedsecret-tokens.yaml
+
+# Rewritten by .github/workflows/build-container.yml on every push to main.
+# Both the Deployment and the docs-sync CronJob run the same image, so this one
+# entry moves both -- and because the tag is derived from the commit, every
+# build produces a diff here, which is what ArgoCD watches to trigger a sync.
+images:
+  - name: ghcr.io/nrp/nrp-ops-agent
+    newName: ghcr.io/djw8605/nrp-ops-bot
+    newTag: sha-0000000

@@ -34,6 +34,23 @@ _TERM: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 #: not enough to crowd out cluster evidence.
 SNIPPET_CHARS: Final = 700
 
+#: Dropped before matching. Operators ask whole questions ("how do I request a
+#: GPU in my pod"), and these words appear in nearly every chunk, so under the
+#: OR fallback they decide the ranking: measured against the live nrp.ai docs,
+#: that query returned three FPGA pages and never surfaced the GPU page at all.
+#: Removing them also lets the precise AND pass succeed far more often, which
+#: is the path that actually ranks well. Deliberately generic English only --
+#: no operations vocabulary ("up", "down", "full", "node") is listed here,
+#: because those words are exactly what distinguishes one runbook from another.
+_STOPWORDS: Final = frozenset(
+    """
+    a an and are as at be been but by can could do does did for from get got
+    has have how i if in into is it its me my of on or our so than that the
+    their them then there these they this to us was we were what when where
+    which who why will with would you your
+    """.split()
+)
+
 
 class Retriever(Protocol):
     """The seam for a future embedding-based retriever."""
@@ -46,8 +63,13 @@ def _fts_query(query: str) -> str:
 
     Each term is double-quoted, which makes FTS5 treat it as a literal and
     neutralises ``NEAR``, ``*``, column filters and unbalanced quotes.
+
+    Stopwords are dropped unless that would empty the query -- a search for
+    "how do I" should still search rather than fail.
     """
-    terms = _TERM.findall(query)[:12]
+    terms = _TERM.findall(query)
+    content = [t for t in terms if t.lower() not in _STOPWORDS]
+    terms = (content or terms)[:12]
     if not terms:
         raise ToolError("empty_query", "The query contained no searchable terms.")
     return " ".join('"' + t.replace('"', "") + '"' for t in terms)

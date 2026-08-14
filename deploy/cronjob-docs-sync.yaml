@@ -43,7 +43,9 @@ spec:
               type: RuntimeDefault
           containers:
             - name: docs-sync
-              image: ghcr.io/nrp/nrp-ops-agent:0.1.0  # TODO: replace with your registry
+              # Placeholder; rewritten by deploy/kustomization.yaml. The agent and
+              # this job intentionally share one image, so one bump moves both.
+              image: ghcr.io/nrp/nrp-ops-agent:0.1.0
               args: ["nrp-ops-docs-sync"]
               securityContext:
                 allowPrivilegeEscalation: false

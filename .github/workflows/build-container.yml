@@ -1,0 +1,186 @@
+---
+name: build container
+
+# The bump job at the end commits deploy/kustomization.yaml back to this branch.
+# Two things stop that from re-triggering this workflow: paths-ignore below
+# (that commit touches nothing else), and GitHub's own rule that pushes made
+# with GITHUB_TOKEN do not start new workflow runs. Either alone is sufficient;
+# both together mean a loop needs two independent mistakes.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'deploy/**'
+      - '**.md'
+  pull_request:
+  workflow_dispatch:
+
+# Serialised per branch so two pushes cannot race on the kustomize commit.
+# Not cancel-in-progress: a run that has already pushed an image should finish
+# writing the tag that points at it.
+concurrency:
+  group: build-container-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # The name as written in the manifests, which is the key kustomize matches on.
+  IMAGE_KEY: ghcr.io/nrp/nrp-ops-agent
+
+jobs:
+  # The image is what ArgoCD will roll out unattended, so the suite runs first.
+  # Without this the pipeline would happily publish a broken build and then
+  # update the manifest that deploys it.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint, type-check and test
+        run: |
+          ruff check .
+          ruff format --check .
+          mypy
+          pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tag
+        id: tag
+        # Derived from the commit so every build produces a distinct tag. A
+        # moving tag such as `latest` would leave kustomization.yaml unchanged,
+        # ArgoCD would see no diff, and nothing would ever roll out.
+        run: echo "tag=sha-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build for testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: nrp-ops-agent:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Runs the image the way Kubernetes will: non-root, read-only root
+      # filesystem, /tmp the only writable mount. This is also the regression
+      # test for playbook packaging -- the runbooks live outside src/ and are
+      # force-included into the wheel, and if that ever stops working
+      # load_playbooks() returns an empty set silently rather than failing.
+      - name: Smoke test the image
+        run: |
+          docker run --rm \
+            --user 65532:65532 \
+            --read-only --tmpfs /tmp \
+            nrp-ops-agent:ci \
+            python -c '
+          from nrp_ops_agent.playbooks import load_playbooks
+          from nrp_ops_agent.tools import registry
+
+          services = set(load_playbooks().services)
+          assert services == {"coder", "jupyterhub", "ceph", "gpu"}, f"playbooks missing: {services}"
+
+          tools = registry()
+          assert len(tools) == 9, f"expected 9 tools, got {len(tools)}"
+
+          print(f"ok: {len(services)} playbooks, {len(tools)} tools")
+          '
+
+      - name: Both console scripts resolve
+        run: |
+          docker run --rm nrp-ops-agent:ci sh -c \
+            'command -v nrp-ops-agent && command -v nrp-ops-docs-sync && command -v git'
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Cached from the build above, so this re-exports rather than rebuilds.
+      - name: Push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+
+  # The GitOps half: point the manifests at the image that was just published.
+  # ArgoCD watches this repository, so the commit below is the deploy trigger.
+  bump:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # yq rather than `kustomize edit set image`: the edit subcommand rewrites
+      # the whole file through its own serialiser and drops every comment, and
+      # kustomization.yaml carries warnings worth keeping (the Pod Security
+      # labels the removed Namespace used to set, and why there is no label
+      # transformer). yq edits in place and preserves them.
+      - name: Point kustomize at the new image
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          if ! command -v yq >/dev/null; then
+            echo "::error::yq is not available on this runner image" && exit 1
+          fi
+          yq -i "
+            (.images[] | select(.name == strenv(IMAGE_KEY)) | .newName) = strenv(IMAGE) |
+            (.images[] | select(.name == strenv(IMAGE_KEY)) | .newTag)  = strenv(TAG)
+          " deploy/kustomization.yaml
+          git diff -- deploy/kustomization.yaml
+
+      - name: Commit and push
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          if git diff --quiet -- deploy/kustomization.yaml; then
+            echo "kustomization already points at ${TAG}; nothing to do"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/kustomization.yaml
+          git commit -m "deploy: roll to ${TAG}" -m "Built from ${GITHUB_SHA}."
+          # Someone may have pushed while the image was building.
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "push rejected, rebasing (attempt ${attempt})"
+            git pull --rebase --autostash
+          done
+          echo "::error::could not push the image bump after 3 attempts" && exit 1

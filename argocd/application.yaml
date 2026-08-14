@@ -1,0 +1,52 @@
+---
+# Applied once, by hand. It is deliberately NOT inside deploy/, because that is
+# the directory this Application renders -- an Application that manages itself
+# is a loop nobody wants to debug at 3am.
+#
+#   kubectl apply -f argocd/application.yaml
+#
+# TODO: confirm the ArgoCD instance. The cluster has the argoproj CRDs and an
+# `argo` namespace, but which ArgoCD owns this Application, and which AppProject
+# it is allowed to join, is a local convention this repository cannot read off
+# the cluster. Check with the NRP admins before applying.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nrp-ops-agent
+  namespace: argo
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/djw8605/nrp-ops-bot.git
+    targetRevision: main
+    path: deploy
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nrp-ops-agent
+
+  syncPolicy:
+    automated:
+      # The CI bump job rewrites the image tag in deploy/kustomization.yaml, so
+      # a code push becomes a sync without anyone clicking anything.
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # deploy/ no longer ships a Namespace, so ArgoCD creates it.
+      #
+      # NOTE: a namespace created this way carries no Pod Security labels. The
+      # Namespace this repo used to ship set enforce/audit/warn=restricted, and
+      # nothing sets them now. Create the namespace by hand with those labels
+      # first, or add managedNamespaceMetadata below, or the workloads run under
+      # whatever the cluster default happens to be.
+      - CreateNamespace=true
+
+    # Preferred over CreateNamespace alone: this puts the Pod Security labels
+    # back under GitOps control rather than relying on whoever ran kubectl.
+    managedNamespaceMetadata:
+      labels:
+        app.kubernetes.io/name: nrp-ops-agent
+        pod-security.kubernetes.io/enforce: restricted
+        pod-security.kubernetes.io/audit: restricted
+        pod-security.kubernetes.io/warn: restricted

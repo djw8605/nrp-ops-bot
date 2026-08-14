@@ -315,6 +315,18 @@ class TestFtsQueryBuilding:
         with pytest.raises(ToolError):
             _fts_query("!!! ???")
 
+    def test_stopwords_are_dropped(self) -> None:
+        """Operators type whole questions. The filler words in them are the
+        reason the OR fallback used to rank a long FPGA FAQ above the GPU page:
+        every chunk contains "how"/"my"/"in", so those terms carry the score.
+        """
+        assert _fts_query("how do I request a GPU in my pod") == '"request" "GPU" "pod"'
+
+    def test_an_all_stopword_query_keeps_its_terms(self) -> None:
+        """Stripping every term would turn a findable query into an error, so
+        the filter only applies when something survives it."""
+        assert _fts_query("how do I") == '"how" "do" "I"'
+
 
 # --------------------------------------------------------------------------- #
 # Retrieval quality

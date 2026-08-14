@@ -10,11 +10,19 @@ and replies in-thread with a finding, cited evidence, and the exact tool calls i
 
 > **Status: Phase 1 complete.** Read-only Kubernetes tools, PromQL, the documentation index, the
 > playbooks, the tool-calling loop, the Slack listener, the deploy manifests and the eval harness
-> are all implemented and tested (358 tests, `ruff` and `mypy --strict` clean). Phase 2 — write
+> are all implemented and tested (371 tests, `ruff` and `mypy --strict` clean). Phase 2 — write
 > actions behind two-human approval — has **not** been started and needs explicit sign-off.
 >
-> Several values are marked `TODO: verify` because they could not be checked from the build
-> environment: see [Before you deploy](#before-you-deploy).
+> The cluster-specific assumptions have since been checked against live Thanos, live
+> kube-state-metrics and the live docs site, and **seven of them were wrong** — including a namespace
+> allowlist that would have silently refused every Ceph and JupyterHub question. Those are fixed.
+>
+> **The loop has now run end to end against the live cluster and a live model.**
+> `deepseek-v4-flash` on `ellm.nrp-nautilus.io` emits OpenAI-style `tool_calls` correctly; a
+> question about failing pods in `coder` resolved in 4 tool calls to a correct, evidenced answer.
+> See [Testing it locally](#testing-it-locally).
+>
+> Still untested: a real Slack workspace, and the container image itself.
 
 ---
 
@@ -133,8 +141,10 @@ nonsense.
 
 `tests/test_playbooks.py` validates every step against the live tool registry — a step naming a
 tool that does not exist, or passing arguments that tool would reject, fails the suite. It also
-asserts that **every unverified PromQL query carries a `TODO: verify` note**, so a reader never
-mistakes a guess for a checked query.
+asserts that **every PromQL query states whether it was verified against the live cluster**, so a
+reader never mistakes a guess for a checked query, and that **every namespace a playbook names is
+permitted by the shipped allowlist** — the check that catches a runbook pointing at a namespace the
+tool would refuse.
 
 ## Agent loop
 
@@ -163,9 +173,9 @@ endpoint, credential, namespace or Slack ID is hardcoded anywhere else in the pa
 | `NRP_OPS_KUBE_MODE` | `auto` | `auto` \| `incluster` \| `kubeconfig` |
 | `NRP_OPS_KUBECONFIG_PATH` / `_CONTEXT` | — | dev only |
 | `NRP_OPS_PROMETHEUS_BASE_URL` | `https://thanos.nrp-nautilus.io` | or `https://prometheus.nrp-nautilus.io` |
-| `NRP_OPS_PROMETHEUS_BEARER_TOKEN` | — | omit if unauthenticated |
+| `NRP_OPS_PROMETHEUS_BEARER_TOKEN` | — | verified unauthenticated; leave unset |
 | `NRP_OPS_PROMETHEUS_TIMEOUT_S` / `_MAX_SERIES` | `10` / `200` | |
-| `NRP_OPS_LLM_BASE_URL` | `https://ellm.nrp-nautilus.io/v1` | **TODO: verify** the `/v1` suffix |
+| `NRP_OPS_LLM_BASE_URL` | `https://ellm.nrp-nautilus.io/v1` | `/v1` verified; POST needs a key |
 | `NRP_OPS_LLM_API_KEY` / `_MODEL` | — | `_MODEL` has no default on purpose |
 | `NRP_OPS_LLM_TEMPERATURE` / `_MAX_TOKENS` | `0.0` / `2048` | |
 | `NRP_OPS_AGENT_MAX_TOOL_CALLS` | `12` | per turn |
@@ -249,41 +259,292 @@ agent authorizes on user ID and does not need the directory.
 
 ## Before you deploy
 
-These could not be verified from the build environment and are marked `TODO: verify` in the source:
+Most of the original unknowns were checked on 2026-08-14 against live Thanos, live
+kube-state-metrics, the live docs site and the live model gateway. **Six of them were wrong**, and
+the corrections are in the source. What that pass found, and what is still open:
 
-1. **`NRP_OPS_LLM_MODEL` has no default** and the pod refuses to start without it. List the
-   available models with `curl https://ellm.nrp-nautilus.io/v1/models`. Confirm the chosen model
-   supports OpenAI-style `tool_calls` — the loop depends on it.
-2. **The `/v1` suffix** on the LLM base URL, and whether the gateway needs an API key.
-3. **Prometheus auth** — whether Thanos or Prometheus needs a bearer token from inside the cluster.
-4. **PromQL in the playbooks.** Every query the live cluster has not confirmed is marked
-   `TODO: verify`; `ceph_*`, `kube_pod_resource_requests` and the nginx ingress label names are the
-   likeliest to differ. Metric names are the one thing a model will invent convincingly.
-5. **Slack team ID and operator/channel IDs** in `deploy/configmap-allowlist.yaml`, and the
-   `NRP_OPS_SLACK_TEAM_ID` env in `deploy/deployment.yaml`.
-6. **`deploy/networkpolicy.yaml`** — the API server CIDR, and the fact that the fallback egress rule
-   permits any public HTTPS destination. A CiliumNetworkPolicy with FQDN rules is sketched in that
-   file and is the version you want if Cilium is the CNI.
-7. **Starlight slug casing** in `url_for()` — the whole path is lowercased, which matches the known
-   `Documentation/` → `/documentation/` mapping but would be wrong for a genuinely mixed-case
-   filename. Spot-check a few generated URLs against the live site.
-8. **Storage class** for the docs PVC (`rook-cephfs` assumed) and the workload names in
-   `jupyterhub.yaml` and `ceph.yaml`.
+### Corrected (was wrong, now verified)
 
-Deploy order:
+1. **The namespace allowlist denied nearly everything it was meant to allow.** It granted
+   `jupyterhub`, `rook-ceph` and `nvidia-device-plugin` — *none of which exist on this cluster*.
+   Because the namespace check runs inside each tool before any API call, every Ceph and JupyterHub
+   question would have been refused silently, which reads like a healthy "nothing found" rather
+   than a misconfiguration. Real: `coder`, `coder-dev`, `coder-user-dev`, `jupyterlab`,
+   `jupyterlab-east`, `rook`/`rook-*`, `gpu-operator`.
+2. **NRP runs nine independent Ceph clusters**, one per namespace (`rook`, `rook-central`,
+   `rook-east`, `rook-ucsd`, `rook-tide`, `rook-south-east`, `rook-pacific`, `rook-haosu`,
+   `rook-fullerton`). "Is Ceph healthy?" has nine answers; every Ceph query is now grouped
+   `by (namespace)` and every answer must name the cluster.
+3. **JupyterHub lives in `jupyterlab`, not `jupyterhub`.** The deployments really are `hub` and
+   `proxy`, but the hub is a Deployment, so its pod is `hub-<generated>` — the assumed `hub-0` was
+   never going to resolve.
+4. **`kube_pod_resource_requests` does not exist** (it is `kube_pod_container_resource_requests`),
+   and it must be restricted to Running pods. Unfiltered it counted 2168 GPU requests against 1133
+   allocatable and reported a *negative* number of free GPUs. Correct answer at the time of
+   checking: 674 in use of 1133, **459 free**.
+5. **There is no nginx ingress.** No `nginx_ingress_controller_*` metric exists; NRP fronts
+   services with haproxy, backends named `<namespace>_<service>_<port>` (e.g. `coder_coder_http`).
+   The old query returned an empty result rather than an error — indistinguishable from "no errors".
+6. **The docs PVC storage class `rook-cephfs` does not exist.** The RWX CephFS class on this
+   cluster is called `cephfs`. The PVC would have stayed Pending forever, leaving the agent
+   with no docs index.
+7. **`ceph_pool_percent_used` is a fraction in 0..1, not a percent.** The fullest pool reads `0.84`,
+   meaning **84% full**. Reported verbatim it sounds like 0.84% — reassuring, and exactly backwards,
+   on the one metric that explains hanging writes.
+
+Also fixed: docs search dropped no stopwords, so under the OR fallback a whole-sentence question
+like *"how do I request a GPU in my pod"* was ranked by the words `how`/`my`/`in` and returned three
+FPGA pages, never surfacing the GPU page. With stopwords removed, top-1 accuracy on ten real
+operator questions went from 2/10 to 8/10.
+
+### Verified correct (no change needed)
+
+- **Prometheus and Thanos need no auth** — both answer `/api/v1/query` with HTTP 200 and no
+  credentials. `prometheus_bearer_token` stays unset.
+- **The `/v1` suffix is right**; `GET /v1/models` returns 200 and lists 14 models.
+- **`ceph_health_status`, `ceph_osd_up`, `ceph_pool_percent_used` all exist** — the metrics flagged
+  as *most* likely to be wrong were the ones that were right.
+- **`gpu-operator/nvidia-device-plugin-daemonset`** exists exactly as assumed.
+- **Sealed-secrets is available** — controller `sealed-secrets` in `sealed-secrets-operator`,
+  so the one Secret this repo needs can live in git as a SealedSecret.
+- **The model drives the loop.** `deepseek-v4-flash` returns well-formed OpenAI `tool_calls`;
+  the gateway 403s unauthenticated POSTs but accepts a key from outside the cluster, so the
+  earlier 403 was missing auth rather than an IP restriction.
+- **`url_for()` slug casing is correct.** Indexing the real repo produced 146 page URLs and all 146
+  appear in the live sitemap; all 234 sitemap entries are lowercase with no trailing slash.
+
+### Still open
+
+1. **The container image has never been built or run.** CI is its first exercise. The smoke test in
+   the build job runs it under the deployment's own security context and asserts the playbooks and
+   all nine tools load, so a broken image fails the pipeline rather than reaching ArgoCD — but no
+   one has watched it happen yet.
+2. **Slack team ID and operator/channel IDs** in `deploy/configmap-allowlist.yaml`, and the
+   `NRP_OPS_SLACK_TEAM_ID` env in `deploy/deployment.yaml`. Still placeholders.
+3. **`deploy/networkpolicy.yaml`** — the API server CIDR, and the fact that the fallback egress rule
+   permits any public HTTPS destination. Needs cluster access to confirm. A CiliumNetworkPolicy with
+   FQDN rules is sketched in that file and is the version you want if Cilium is the CNI.
+4. **The ArgoCD instance and AppProject** for `argocd/application.yaml`. The cluster has the
+   argoproj CRDs and an `argo` namespace, but which instance owns this app is local convention.
+5. **A documentation gap, not a code bug:** no page on nrp.ai covers a PVC stuck `Pending` — no
+   indexed chunk contains both "pvc" and "pending". `admindocs/storage/user-pvc-issues` is about XFS
+   corruption. Since that is among the most common storage questions, the agent will answer it from
+   cluster evidence alone, and the ceph playbook now warns against stretching that page to fit.
+
+## Testing it locally
+
+The Slack listener needs a workspace, an app token and a Socket Mode connection before it answers
+anything. `nrp-ops-ask` skips all of that and calls the *same* `Agent.investigate` — same tools,
+same allowlist, same redaction, same budgets — so a question that works here works in Slack.
+
+`.env` supplies the model; three more settings have production defaults that are wrong on a laptop:
 
 ```bash
-kubectl apply -f deploy/namespace.yaml
+NRP_OPS_LLM_API_KEY=...            # you have this
+NRP_OPS_LLM_MODEL=deepseek-v4-flash
+NRP_OPS_ALLOWLIST_PATH=dev/allowlist.yaml
+NRP_OPS_DOCS_DB_PATH=./docs.sqlite3
+NRP_OPS_KUBE_MODE=kubeconfig
+NRP_OPS_KUBECONFIG_PATH=dev/kubeconfig-proxy.yaml
+```
+
+The allowlist matters most. Its default is `/etc/nrp-ops-agent/allowlist.yaml`, which does not exist
+locally, and **an absent policy file is deny-everything** — every Kubernetes tool then refuses
+before making an API call, which reads exactly like a healthy, empty cluster. `--check` catches
+that and the other two:
+
+```bash
+nrp-ops-ask --check
+```
+
+Build the docs index once (clones the docs repo, ~870 chunks):
+
+```bash
+python -m nrp_ops_agent.docs_index.sync --db-path ./docs.sqlite3
+```
+
+### Kubernetes access needs `kubectl proxy`
+
+NRP's API server certificate has no Authority Key Identifier extension. OpenSSL 3.x — Python 3.13
+on macOS ships 3.6 — rejects it outright:
+
+```
+SSLCertVerificationError: certificate verify failed: Missing Authority Key Identifier
+```
+
+`kubectl` on the same machine works fine, so this looks like a bug in the agent and is not one. It
+also sidesteps a second problem: the `nautilus` context authenticates through OIDC, and kubectl is
+the tool that definitely refreshes those tokens. Run the proxy and point the agent at it:
+
+```bash
+kubectl proxy --port=8001 &
+```
+
+`dev/kubeconfig-proxy.yaml` targets `http://127.0.0.1:8001`, so no TLS and no credentials are
+involved on the agent's side. None of this applies in the cluster, where `NRP_OPS_KUBE_MODE` is
+`incluster` and the ServiceAccount CA is used.
+
+### Asking things
+
+```bash
+nrp-ops-ask --show-tools "are there any failing pods in the coder namespace?"
+```
+
+`--show-tools` prints every call with arguments, latency and outcome, which is the fastest way to
+see whether the model is following the playbook or wandering. `--which-playbook` prints the
+selected runbook and exits without calling the model, and `--quiet` drops the live progress lines.
+
+To replay the scored suite instead of an ad-hoc question:
+
+```bash
+python evals/run_evals.py --only coder      # one case
+python evals/run_evals.py                   # all 20, scored
+```
+
+> `nrp-ops-ask` is a development entry point. It performs no Slack authorization — there is no
+> Slack user to authorize — so it is not in the container's `args` and has no place in the
+> Deployment. The namespace allowlist still applies, because that check lives inside each tool
+> rather than at the edge.
+
+## Container build and GitOps
+
+The application and the manifests that deploy it share this repository, so a code change and the
+rollout that carries it land in one history. ArgoCD watches `deploy/`.
+
+`.github/workflows/build-container.yml` runs on every push to `main`:
+
+1. **test** — `ruff`, `mypy`, `pytest`. The image is rolled out unattended, so a failing suite must
+   stop the pipeline before anything is published.
+2. **build** — builds the image, runs it the way Kubernetes will (non-root `65532`, read-only root
+   filesystem, `/tmp` the only writable mount) and asserts the playbooks and all nine tools load,
+   then pushes to `ghcr.io/djw8605/nrp-ops-bot` tagged `sha-<short>` and `latest`.
+3. **bump** — rewrites `newTag` in `deploy/kustomization.yaml` and commits it back. **That commit is
+   the deploy trigger**: ArgoCD sees the diff and syncs.
+
+The tag is derived from the commit on purpose. A moving tag such as `latest` would leave
+`kustomization.yaml` byte-identical, ArgoCD would see no diff, and nothing would ever roll out.
+
+The bump commit cannot re-trigger the workflow: it touches only `deploy/`, which is in
+`paths-ignore`, and pushes made with `GITHUB_TOKEN` do not start workflow runs. Either alone would
+be enough.
+
+Pull requests build and smoke-test the image but never push it.
+
+> **First run:** the GHCR package is created private. Grant the repository access under
+> *Package settings → Manage Actions access* (or make it public) or the cluster cannot pull it.
+> If `main` is protected, the `bump` job needs permission to push to it.
+
+### The namespace is not created here
+
+`deploy/` deliberately contains no `Namespace`. It is owned by ArgoCD's destination or by a cluster
+admin.
+
+> **Carry the Pod Security labels across.** The `Namespace` this repo used to ship set
+> `pod-security.kubernetes.io/enforce|audit|warn: restricted`. **Nothing in `deploy/` sets them any
+> more.** The workloads still satisfy `restricted`, but nothing enforces that they continue to —
+> whoever creates the namespace should apply those labels:
+>
+> ```bash
+> kubectl label namespace nrp-ops-agent \
+>   pod-security.kubernetes.io/enforce=restricted \
+>   pod-security.kubernetes.io/audit=restricted \
+>   pod-security.kubernetes.io/warn=restricted
+> ```
+
+### Secrets: what needs kubeseal
+
+**Exactly one Secret, `nrp-ops-agent-tokens`, with three keys.** Everything else the agent reads is
+a ConfigMap or an env var and is already in git.
+
+| Key | Where it comes from | Needed for |
+|---|---|---|
+| `NRP_OPS_SLACK_BOT_TOKEN` | Slack app → OAuth & Permissions (`xoxb-…`) | posting replies |
+| `NRP_OPS_SLACK_APP_TOKEN` | Slack app → Basic Information → App-Level Tokens (`xapp-…`, scope `connections:write`) | the Socket Mode connection |
+| `NRP_OPS_LLM_API_KEY` | the NRP LLM gateway | every model call |
+
+The cluster runs the sealed-secrets controller (`sealed-secrets` in namespace
+`sealed-secrets-operator`, verified 2026-08-14), which is what makes this repository GitOps-able: a
+`Secret` must never be committed, but the `SealedSecret` it becomes is encrypted to *this cluster's*
+key and is safe in a public repo.
+
+Generate it — note `--dry-run=client`, so the plaintext Secret never reaches the API server:
+
+```bash
 kubectl -n nrp-ops-agent create secret generic nrp-ops-agent-tokens \
   --from-literal=NRP_OPS_SLACK_BOT_TOKEN=xoxb-... \
   --from-literal=NRP_OPS_SLACK_APP_TOKEN=xapp-... \
-  --from-literal=NRP_OPS_LLM_API_KEY=...
-kubectl apply -f deploy/serviceaccount.yaml -f deploy/clusterrole.yaml \
-               -f deploy/clusterrolebinding.yaml -f deploy/configmap-allowlist.yaml
-kubectl apply -f deploy/deployment.yaml -f deploy/networkpolicy.yaml
-kubectl apply -f deploy/cronjob-docs-sync.yaml
-kubectl -n nrp-ops-agent create job --from=cronjob/nrp-ops-agent-docs-sync docs-sync-initial
+  --from-literal=NRP_OPS_LLM_API_KEY=... \
+  --dry-run=client -o yaml > secret-tokens.yaml
 ```
+
+```bash
+kubeseal --controller-name sealed-secrets --controller-namespace sealed-secrets-operator \
+  --format yaml < secret-tokens.yaml > deploy/sealedsecret-tokens.yaml
+```
+
+```bash
+rm secret-tokens.yaml
+```
+
+Then uncomment `- sealedsecret-tokens.yaml` in `deploy/kustomization.yaml` and commit **only** the
+sealed file. `secret-tokens.yaml` and `*.secret.yaml` are in `.gitignore` so the plaintext cannot be
+committed by accident.
+
+> The namespace is encoded into the sealed value. A SealedSecret sealed for `nrp-ops-agent` will not
+> decrypt anywhere else, so create the namespace before sealing and re-seal if you ever move it.
+
+Rotating a token means repeating the above and pushing — ArgoCD applies the new SealedSecret, but
+the Deployment does not restart on a Secret change, so finish with:
+
+```bash
+kubectl -n nrp-ops-agent rollout restart deployment/nrp-ops-agent
+```
+
+### Deploying
+
+1. **Create the namespace with the Pod Security labels.** `deploy/` no longer ships a Namespace, and
+   a namespace ArgoCD creates on its own carries no PSS labels:
+   ```bash
+   kubectl create namespace nrp-ops-agent
+   kubectl label namespace nrp-ops-agent \
+     pod-security.kubernetes.io/enforce=restricted \
+     pod-security.kubernetes.io/audit=restricted \
+     pod-security.kubernetes.io/warn=restricted
+   ```
+   `argocd/application.yaml` also sets these via `managedNamespaceMetadata`, which keeps them under
+   GitOps rather than depending on whoever ran the command above.
+2. **Seal the tokens** (previous section) and uncomment the resource.
+3. **Fill in the two remaining placeholders**: `NRP_OPS_SLACK_TEAM_ID` in `deploy/deployment.yaml`,
+   and the operator/channel IDs in `deploy/configmap-allowlist.yaml`. The agent denies everyone
+   until those are real.
+4. **Make the GHCR package readable by the cluster.** It is created private on first push; either
+   make it public or add a pull secret.
+5. **Register the Application**, after checking with the NRP admins which ArgoCD instance and
+   AppProject to use — the cluster has the argoproj CRDs and an `argo` namespace, but that choice is
+   local convention this repo cannot infer:
+   ```bash
+   kubectl apply -f argocd/application.yaml
+   ```
+6. **Seed the docs index.** The PVC starts empty and the CronJob is on a schedule, so `search_docs`
+   returns nothing until it has run once:
+   ```bash
+   kubectl -n nrp-ops-agent create job --from=cronjob/nrp-ops-agent-docs-sync docs-sync-initial
+   ```
+
+Render what ArgoCD will apply, without a cluster:
+
+```bash
+kubectl kustomize deploy/
+```
+
+To apply by hand instead of through ArgoCD:
+
+```bash
+kubectl apply -k deploy/
+```
+
+The docs index starts empty, so run that CronJob once before expecting `search_docs` to return
+anything.
 
 Confirm the RBAC does what it claims, against the real cluster:
 
