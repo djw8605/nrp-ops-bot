@@ -503,7 +503,7 @@ admin.
 > whoever creates the namespace should apply those labels:
 >
 > ```bash
-> kubectl label namespace nrp-ops-agent \
+> kubectl label namespace system-nrp-ops-bot \
 >   pod-security.kubernetes.io/enforce=restricted \
 >   pod-security.kubernetes.io/audit=restricted \
 >   pod-security.kubernetes.io/warn=restricted
@@ -533,7 +533,7 @@ disk and never reaches the API server (`--dry-run=client`):
 
 ```bash
 set -a; . ./.env; set +a
-kubectl create secret generic nrp-ops-agent-tokens --namespace nrp-ops-agent \
+kubectl create secret generic nrp-ops-agent-tokens --namespace system-nrp-ops-bot \
   --from-literal=NRP_OPS_SLACK_BOT_TOKEN="$NRP_OPS_SLACK_BOT_TOKEN" \
   --from-literal=NRP_OPS_SLACK_APP_TOKEN="$NRP_OPS_SLACK_APP_TOKEN" \
   --from-literal=NRP_OPS_LLM_API_KEY="$NRP_OPS_LLM_API_KEY" \
@@ -548,7 +548,7 @@ entry there *overrides* the same key arriving through `envFrom`, so a value seal
 would lose to the manifest anyway.
 
 > **Strict scope.** The ciphertext is bound to both the name `nrp-ops-agent-tokens` and the
-> namespace `nrp-ops-agent`. Rename either and the controller cannot decrypt it — and it reports
+> namespace `system-nrp-ops-bot`. Rename either and the controller cannot decrypt it — and it reports
 > that in its own log rather than failing the sync, so the symptom is a pod stuck without
 > credentials rather than an obvious error. Re-seal instead of editing.
 
@@ -559,7 +559,7 @@ Rotating a token means repeating the above and pushing — ArgoCD applies the ne
 the Deployment does not restart on a Secret change, so finish with:
 
 ```bash
-kubectl -n nrp-ops-agent rollout restart deployment/nrp-ops-agent
+kubectl -n system-nrp-ops-bot rollout restart deployment/nrp-ops-agent
 ```
 
 ### Deploying
@@ -567,8 +567,8 @@ kubectl -n nrp-ops-agent rollout restart deployment/nrp-ops-agent
 1. **Create the namespace with the Pod Security labels.** `deploy/` no longer ships a Namespace, and
    a namespace ArgoCD creates on its own carries no PSS labels:
    ```bash
-   kubectl create namespace nrp-ops-agent
-   kubectl label namespace nrp-ops-agent \
+   kubectl create namespace system-nrp-ops-bot
+   kubectl label namespace system-nrp-ops-bot \
      pod-security.kubernetes.io/enforce=restricted \
      pod-security.kubernetes.io/audit=restricted \
      pod-security.kubernetes.io/warn=restricted
@@ -591,7 +591,7 @@ kubectl -n nrp-ops-agent rollout restart deployment/nrp-ops-agent
 6. **Seed the docs index.** The PVC starts empty and the CronJob is on a schedule, so `search_docs`
    returns nothing until it has run once:
    ```bash
-   kubectl -n nrp-ops-agent create job --from=cronjob/nrp-ops-agent-docs-sync docs-sync-initial
+   kubectl -n system-nrp-ops-bot create job --from=cronjob/nrp-ops-agent-docs-sync docs-sync-initial
    ```
 
 Render what ArgoCD will apply, without a cluster:
@@ -612,9 +612,9 @@ anything.
 Confirm the RBAC does what it claims, against the real cluster:
 
 ```bash
-kubectl auth can-i get secrets --as=system:serviceaccount:nrp-ops-agent:nrp-ops-agent   # want: no
-kubectl auth can-i create pods/exec --as=system:serviceaccount:nrp-ops-agent:nrp-ops-agent  # no
-kubectl auth can-i list pods --as=system:serviceaccount:nrp-ops-agent:nrp-ops-agent      # want: yes
+kubectl auth can-i get secrets --as=system:serviceaccount:system-nrp-ops-bot:nrp-ops-agent   # want: no
+kubectl auth can-i create pods/exec --as=system:serviceaccount:system-nrp-ops-bot:nrp-ops-agent  # no
+kubectl auth can-i list pods --as=system:serviceaccount:system-nrp-ops-bot:nrp-ops-agent      # want: yes
 ```
 
 ## Evals

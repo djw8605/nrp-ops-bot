@@ -9,7 +9,7 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: nrp-ops-agent-docs-sync
-  namespace: nrp-ops-agent
+  namespace: system-nrp-ops-bot
   labels:
     app.kubernetes.io/name: nrp-ops-agent
     app.kubernetes.io/component: docs-sync

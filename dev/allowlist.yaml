@@ -32,4 +32,4 @@ namespaces_denied:
   - kube-public
   - kube-node-lease
   - cert-manager
-  - nrp-ops-agent
+  - system-nrp-ops-bot

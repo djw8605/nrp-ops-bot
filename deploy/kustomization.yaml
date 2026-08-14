@@ -17,7 +17,7 @@
 #   future manifest can quietly relax the security context and still deploy.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: nrp-ops-agent
+namespace: system-nrp-ops-bot
 # No `commonLabels` / `labels` here on purpose. Every manifest already carries
 # app.kubernetes.io/name, and kustomize's label transformer also rewrites label
 # *selectors*: it appended app.kubernetes.io/name to the kube-dns podSelector in
@@ -34,7 +34,7 @@ resources:
   # Encrypted to this cluster's sealed-secrets key, so it is safe in a public
   # repo: only the controller in this cluster can decrypt it. Sealed with the
   # default strict scope, which binds the ciphertext to BOTH the name
-  # `nrp-ops-agent-tokens` and the namespace `nrp-ops-agent` -- renaming either
+  # `nrp-ops-agent-tokens` and the namespace `system-nrp-ops-bot` -- renaming either
   # makes it undecryptable and the controller will log that rather than fail
   # loudly, so re-seal instead of editing.
   - sealedsecret-tokens.yaml

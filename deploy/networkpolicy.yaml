@@ -14,7 +14,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: nrp-ops-agent-egress
-  namespace: nrp-ops-agent
+  namespace: system-nrp-ops-bot
   labels:
     app.kubernetes.io/name: nrp-ops-agent
 spec:
@@ -79,7 +79,7 @@ spec:
 # kind: CiliumNetworkPolicy
 # metadata:
 #   name: nrp-ops-agent-egress-fqdn
-#   namespace: nrp-ops-agent
+#   namespace: system-nrp-ops-bot
 # spec:
 #   endpointSelector:
 #     matchLabels:

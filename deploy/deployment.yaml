@@ -3,7 +3,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: nrp-ops-agent
-  namespace: nrp-ops-agent
+  namespace: system-nrp-ops-bot
   labels:
     app.kubernetes.io/name: nrp-ops-agent
 spec:
@@ -43,7 +43,7 @@ spec:
               drop: ["ALL"]
           envFrom:
             # Slack and LLM credentials. Create with:
-            #   kubectl -n nrp-ops-agent create secret generic nrp-ops-agent-tokens \
+            #   kubectl -n system-nrp-ops-bot create secret generic nrp-ops-agent-tokens \
             #     --from-literal=NRP_OPS_SLACK_BOT_TOKEN=xoxb-... \
             #     --from-literal=NRP_OPS_SLACK_APP_TOKEN=xapp-... \
             #     --from-literal=NRP_OPS_LLM_API_KEY=...
@@ -118,7 +118,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: nrp-ops-agent-docs
-  namespace: nrp-ops-agent
+  namespace: system-nrp-ops-bot
   labels:
     app.kubernetes.io/name: nrp-ops-agent
 spec:

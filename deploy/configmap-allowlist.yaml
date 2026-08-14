@@ -9,7 +9,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: nrp-ops-agent-allowlist
-  namespace: nrp-ops-agent
+  namespace: system-nrp-ops-bot
   labels:
     app.kubernetes.io/name: nrp-ops-agent
 data:
@@ -77,4 +77,4 @@ data:
       - kube-public
       - kube-node-lease
       - cert-manager
-      - nrp-ops-agent
+      - system-nrp-ops-bot
