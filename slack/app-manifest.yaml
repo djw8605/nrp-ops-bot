@@ -40,6 +40,21 @@ features:
     # Socket Mode holds one connection while the pod runs, so presence would
     # advertise pod health to every user. Nothing reads it; leave it off.
     always_online: false
+  # REQUIRED for DMs. Omit this block and Slack defaults the Messages tab to
+  # off, so the DM composer shows "Sending messages to this app has been turned
+  # off" -- even though the app subscribes to message.im and holds im:history.
+  # `messages_tab_read_only_enabled: false` is the checkbox "Allow users to send
+  # Slash commands and messages from the messages tab"; leaving it true shows
+  # the conversation but still refuses to send.
+  #
+  #   Editing this file does NOT change an app that already exists. Apply it at
+  #   api.slack.com/apps -> the app -> Features -> App Home, or paste the
+  #   manifest into the App Manifest page. Not a scope change, so no reinstall.
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+    # Nothing renders a Home tab; the agent only replies in-thread.
+    home_tab_enabled: false
 
 oauth_config:
   scopes:
