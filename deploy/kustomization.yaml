@@ -17,9 +17,7 @@
 #   future manifest can quietly relax the security context and still deploy.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-
 namespace: nrp-ops-agent
-
 # No `commonLabels` / `labels` here on purpose. Every manifest already carries
 # app.kubernetes.io/name, and kustomize's label transformer also rewrites label
 # *selectors*: it appended app.kubernetes.io/name to the kube-dns podSelector in
@@ -40,7 +38,6 @@ resources:
   # makes it undecryptable and the controller will log that rather than fail
   # loudly, so re-seal instead of editing.
   - sealedsecret-tokens.yaml
-
 # Rewritten by .github/workflows/build-container.yml on every push to main.
 # Both the Deployment and the docs-sync CronJob run the same image, so this one
 # entry moves both -- and because the tag is derived from the commit, every
@@ -48,4 +45,4 @@ resources:
 images:
   - name: ghcr.io/nrp/nrp-ops-agent
     newName: ghcr.io/djw8605/nrp-ops-bot
-    newTag: sha-0000000
+    newTag: sha-cd9cc27
