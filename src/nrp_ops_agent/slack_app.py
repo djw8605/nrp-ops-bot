@@ -22,9 +22,9 @@ import sys
 from typing import Any
 
 from nrp_ops_agent import audit
-from nrp_ops_agent.agent import Agent, AgentResult
+from nrp_ops_agent.agent import Agent, AgentResult, ThreadMessage
 from nrp_ops_agent.authz import Authorizer, SlackEvent
-from nrp_ops_agent.config import Settings, get_settings
+from nrp_ops_agent.config import AllowlistLoader, Settings, get_allowlist_loader, get_settings
 from nrp_ops_agent.redact import redact
 
 log = logging.getLogger("nrp_ops_agent.slack")
@@ -42,10 +42,15 @@ class SlackOps:
         settings: Settings | None = None,
         authorizer: Authorizer | None = None,
         agent: Agent | None = None,
+        loader: AllowlistLoader | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._authz = authorizer or Authorizer(self._settings)
         self._agent = agent or Agent(self._settings)
+        # Same policy source the authorizer uses: "is this person an operator"
+        # must have one answer here and in authz, or a thread author could be
+        # refused a turn of their own while their text is replayed as trusted.
+        self._loader = loader or get_allowlist_loader()
 
     # ------------------------------------------------------------ outbound --
 
@@ -74,6 +79,75 @@ class SlackOps:
         except Exception:
             log.debug("could not add deny reaction", exc_info=True)
 
+    # -------------------------------------------------------------- inbound --
+
+    async def _thread_history(self, client: Any, event: SlackEvent) -> list[ThreadMessage]:
+        """Earlier messages in this thread, oldest first, for conversation context.
+
+        Best-effort by design. The bot may hold ``im:history`` but not
+        ``channels:history``, in which case ``conversations.replies`` fails with
+        ``missing_scope`` in channels and succeeds in DMs. Losing the history
+        costs continuity; failing the whole investigation over it would cost the
+        answer, so a failure is audited and the turn proceeds context-free.
+        """
+        limit = self._settings.slack_thread_history_limit
+        if limit <= 0 or not event.thread_ts:
+            # Not a threaded reply: the message that starts a thread has no
+            # history behind it, and there is nothing to fetch.
+            return []
+
+        try:
+            response = await client.conversations_replies(
+                channel=event.channel, ts=event.thread_ts, limit=limit + 1
+            )
+            raw = list(response.get("messages") or [])
+        except Exception as exc:
+            audit.emit(
+                "thread_history",
+                slack_channel=event.channel,
+                thread_ts=event.thread_ts,
+                ok=False,
+                reason=type(exc).__name__,
+                extra={"detail": str(exc)[:200]},
+            )
+            log.warning("could not read thread history: %s", exc)
+            return []
+
+        operators = self._loader.load().operators
+        history: list[ThreadMessage] = []
+        for message in raw:
+            ts = str(message.get("ts") or "")
+            if ts == event.ts:
+                continue  # the message being answered; added by the caller
+            if message.get("subtype"):
+                continue  # joins, leaves, channel_topic and friends carry no context
+            text = str(message.get("text") or "").strip()
+            if not text or text == ACK_TEXT:
+                continue
+            is_bot = bool(message.get("bot_id"))
+            author = str(message.get("user") or message.get("bot_id") or "")
+            history.append(
+                ThreadMessage(
+                    author=author,
+                    text=text,
+                    is_bot=is_bot,
+                    is_operator=not is_bot and author in operators,
+                )
+            )
+
+        history = _fit_char_budget(history, self._settings.slack_thread_history_char_budget)
+        audit.emit(
+            "thread_history",
+            slack_channel=event.channel,
+            thread_ts=event.thread_ts,
+            ok=True,
+            extra={
+                "messages": len(history),
+                "untrusted": sum(1 for m in history if not m.is_bot and not m.is_operator),
+            },
+        )
+        return history
+
     # ------------------------------------------------------------- handling --
 
     async def handle(self, event: SlackEvent, client: Any) -> AgentResult | None:
@@ -84,6 +158,8 @@ class SlackOps:
                 # operator, or that a channel is wired up.
                 await self._react(client, channel=event.channel, ts=event.ts)
                 return None
+
+            history = await self._thread_history(client, event)
 
             ack_ts = await self._post(
                 client, channel=event.channel, thread_ts=event.reply_thread_ts, text=ACK_TEXT
@@ -99,7 +175,9 @@ class SlackOps:
                         log.debug("progress update failed", exc_info=True)
 
             try:
-                result = await self._agent.investigate(event.text, progress=progress)
+                result = await self._agent.investigate(
+                    event.text, history=history, progress=progress
+                )
             except Exception as exc:
                 log.exception("investigation failed")
                 text = f"The investigation failed: {type(exc).__name__}: {exc}"
@@ -134,6 +212,21 @@ class SlackOps:
                 extra={"tool_calls": len(result.tool_calls), "iterations": result.iterations},
             )
             return result
+
+
+def _fit_char_budget(history: list[ThreadMessage], budget: int) -> list[ThreadMessage]:
+    """Drop the oldest messages until the history fits, keeping order.
+
+    Oldest-first because the turns nearest the question are the ones that
+    resolve its pronouns; the opening message of a long thread rarely is.
+    """
+    if budget <= 0:
+        return []
+    total = sum(len(m.text) for m in history)
+    kept = list(history)
+    while kept and total > budget:
+        total -= len(kept.pop(0).text)
+    return kept
 
 
 def format_reply(result: AgentResult) -> str:

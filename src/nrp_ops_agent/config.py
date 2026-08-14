@@ -47,7 +47,8 @@ class Settings(BaseSettings):
     slack_bot_token: SecretStr = Field(
         default=SecretStr(""),
         description="xoxb-... bot token. Scopes: app_mentions:read, chat:write, "
-        "im:history, reactions:write.",
+        "im:history, reactions:write, and channels:history/groups:history for "
+        "reading thread context in channels.",
     )
     slack_app_token: SecretStr = Field(
         default=SecretStr(""),
@@ -66,6 +67,21 @@ class Settings(BaseSettings):
     slack_allow_dms: bool = Field(
         default=True,
         description="Whether message.im events from allowlisted operators are accepted.",
+    )
+    slack_thread_history_limit: int = Field(
+        default=20,
+        ge=0,
+        le=200,
+        description="How many earlier messages in the thread are read for context. 0 "
+        "disables thread reading entirely, restoring the one-message-at-a-time "
+        "behaviour. Needs channels:history/groups:history for channels; im:history "
+        "already covers DMs.",
+    )
+    slack_thread_history_char_budget: int = Field(
+        default=12_000,
+        ge=0,
+        description="Cap on total characters of thread history sent to the model. The "
+        "oldest messages are dropped first, so the turns nearest the question survive.",
     )
 
     # ---------------------------------------------------------------- Authz --

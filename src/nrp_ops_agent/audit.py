@@ -41,6 +41,7 @@ AuditEvent = Literal[
     "tool_error",
     "redaction_hit",
     "reply_sent",
+    "thread_history",
     "startup",
     "policy_reload",
 ]

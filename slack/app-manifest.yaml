@@ -66,10 +66,22 @@ oauth_config:
                             # signal a denial produces -- the bot posts no text
                             # on deny so it cannot be used to enumerate the
                             # operator allowlist
+      # Thread context. `conversations.replies` needs a history scope for the
+      # conversation type it is called on, and without one a follow-up like
+      # "restart it" reaches the model with no idea what "it" is. These read
+      # only the thread the bot was addressed in -- the agent never calls
+      # conversations.history, so this is not channel backlog access.
+      #
+      # ADDING THESE REQUIRES A REINSTALL. Scope changes do not take effect
+      # until the workspace re-authorizes the app, and until then
+      # conversations.replies fails with `missing_scope` in channels (DMs keep
+      # working on im:history). The failure is caught and audited as
+      # `thread_history ok=false`; the bot still answers, just without context.
+      - channels:history    # thread replies in public channels
+      - groups:history      # thread replies in private channels
 
-# Deliberately NOT requested: channels:history, groups:history, users:read,
-# files:read. The agent authorizes on user ID and never needs the directory or
-# the ability to read channel backlog. Adding any of them widens what a prompt
+# Deliberately NOT requested: users:read, files:read. The agent authorizes on
+# user ID and never needs the directory. Adding either widens what a prompt
 # injection could reach.
 
 settings:

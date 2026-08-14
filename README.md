@@ -169,6 +169,8 @@ endpoint, credential, namespace or Slack ID is hardcoded anywhere else in the pa
 | `NRP_OPS_SLACK_TEAM_ID` | — | events from any other team are denied |
 | `NRP_OPS_SLACK_DENY_REACTION` | `no_entry` | denied messages get an emoji and nothing else |
 | `NRP_OPS_SLACK_ALLOW_DMS` | `true` | |
+| `NRP_OPS_SLACK_THREAD_HISTORY_LIMIT` | `20` | earlier thread messages read for context; `0` disables |
+| `NRP_OPS_SLACK_THREAD_HISTORY_CHAR_BUDGET` | `12000` | oldest thread turns dropped past this |
 | `NRP_OPS_ALLOWLIST_PATH` | `/etc/nrp-ops-agent/allowlist.yaml` | ConfigMap-mounted, hot-reloaded |
 | `NRP_OPS_RATE_LIMIT_PER_HOUR` | `10` | per-user token bucket |
 | `NRP_OPS_KUBE_MODE` | `auto` | `auto` \| `incluster` \| `kubeconfig` |
@@ -280,7 +282,11 @@ One JSON object per line on stdout. Stable keys; absent fields are omitted rathe
 | `ok` | bool | outcome-bearing events |
 
 `event` is one of `startup`, `policy_reload`, `authz_allow`, `authz_deny`, `model_call`,
-`model_error`, `tool_call`, `tool_error`, `redaction_hit`, `reply_sent`.
+`model_error`, `tool_call`, `tool_error`, `redaction_hit`, `thread_history`, `reply_sent`.
+
+`thread_history` records how much prior conversation was read for a turn (`messages`, and
+`untrusted` for the count written by non-operators). `ok: false` on it means the read failed —
+almost always a missing history scope — and the turn proceeded without context.
 
 Two things are deliberately absent: secret values (tool arguments are scrubbed before emission) and
 full log bodies (pod logs are large and attacker-controlled — archiving them would make the audit
@@ -316,8 +322,29 @@ tokens go into the sealed Secret; the Deployment consumes them via `envFrom`.
 
 Doing it by hand instead: *From scratch*, then Socket Mode → enable and generate the app token;
 **OAuth & Permissions** → bot scopes `app_mentions:read`, `chat:write`, `im:history`,
-`reactions:write` and nothing more; **Event Subscriptions** → bot events `app_mention` and
-`message.im`; install to the workspace.
+`reactions:write`, `channels:history`, `groups:history` and nothing more; **Event Subscriptions** →
+bot events `app_mention` and `message.im`; install to the workspace.
+
+### Thread context needs a reinstall
+
+The bot reads the thread it is mentioned in so a follow-up like *"is it still broken?"* resolves
+against what was already said. That calls `conversations.replies`, which needs a history scope for
+the conversation type: `im:history` (already granted) covers DMs, `channels:history` and
+`groups:history` cover public and private channels.
+
+**Editing the manifest does not grant a scope to an app that is already installed.** Apply the
+manifest at *App Manifest*, then **reinstall** from *Install App* — Slack will show the added
+permissions and re-issue the `xoxb-…` token. Put the new token in the sealed Secret if it changed.
+
+Until that happens the bot keeps working: `conversations.replies` fails with `missing_scope` in
+channels, the failure is audited as `thread_history` with `ok: false`, and the turn is answered
+without context — exactly the behaviour that made threads feel forgetful in the first place. Threads
+in DMs gain context immediately, since `im:history` is already held.
+
+Non-operators can reply inside a thread an operator started. Their messages are included as context
+but wrapped in `<untrusted_thread_message>`, the same envelope used for pod logs, so they read as
+data and never as instructions — the operator-only boundary in `authz.py` is not weakened by
+reading the thread. Set `NRP_OPS_SLACK_THREAD_HISTORY_LIMIT=0` to turn thread reading off entirely.
 
 Not requested, deliberately: `channels:history`, `groups:history`, `users:read`, `files:read`. The
 agent authorizes on user ID and does not need the directory.

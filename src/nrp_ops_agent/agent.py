@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
@@ -35,7 +35,12 @@ import httpx
 from nrp_ops_agent import audit
 from nrp_ops_agent.config import Settings, get_allowlist_loader, get_settings
 from nrp_ops_agent.playbooks import get_playbooks
-from nrp_ops_agent.prompts import build_system_prompt, wrap_operator_message, wrap_untrusted
+from nrp_ops_agent.prompts import (
+    build_system_prompt,
+    wrap_operator_message,
+    wrap_untrusted,
+    wrap_untrusted_thread_message,
+)
 from nrp_ops_agent.tools import ToolResult, dispatch, tool_schemas
 
 #: Rough characters-per-token. Used only to enforce the output budget, where a
@@ -43,6 +48,34 @@ from nrp_ops_agent.tools import ToolResult, dispatch, tool_schemas
 CHARS_PER_TOKEN: Final = 4
 
 ProgressFn = Callable[[str], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class ThreadMessage:
+    """One earlier Slack message, already classified by the caller.
+
+    The classification is the security-relevant part and is deliberately not
+    inferred here: :mod:`nrp_ops_agent.slack_app` decides who is an operator by
+    the same allowlist :mod:`nrp_ops_agent.authz` uses, so there is one answer to
+    "is this person trusted" rather than two that can drift apart.
+    """
+
+    author: str
+    text: str
+    #: A message the bot itself posted. Replayed as an assistant turn.
+    is_bot: bool = False
+    #: Author is in ``operators``. Only these are replayed as instructions.
+    is_operator: bool = False
+
+    def render(self) -> dict[str, Any]:
+        if self.is_bot:
+            return {"role": "assistant", "content": self.text}
+        if self.is_operator:
+            return {"role": "user", "content": wrap_operator_message(self.text)}
+        return {
+            "role": "user",
+            "content": wrap_untrusted_thread_message(self.author, self.text),
+        }
 
 
 @dataclass(frozen=True)
@@ -177,18 +210,28 @@ class Agent:
 
     # ------------------------------------------------------------ the loop --
 
-    async def investigate(self, message: str, *, progress: ProgressFn | None = None) -> AgentResult:
+    async def investigate(
+        self,
+        message: str,
+        *,
+        history: Sequence[ThreadMessage] | None = None,
+        progress: ProgressFn | None = None,
+    ) -> AgentResult:
         settings = self._settings
         deadline = time.monotonic() + settings.agent_wall_clock_timeout_s
 
-        playbook = get_playbooks().select(message)
+        # Playbook selection reads the thread too: "restart it" on its own
+        # matches nothing, while the operator's earlier "coder-0 is OOMKilling"
+        # picks the right playbook for the follow-up.
+        history = tuple(history or ())
+        selection_text = "\n".join([*(m.text for m in history if not m.is_bot), message])
+        playbook = get_playbooks().select(selection_text)
         namespaces = get_allowlist_loader().load().namespaces
         system = build_system_prompt(playbook, allowed_namespaces=namespaces)
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": wrap_operator_message(message)},
-        ]
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+        messages.extend(m.render() for m in history)
+        messages.append({"role": "user", "content": wrap_operator_message(message)})
 
         result = AgentResult(text="")
         calls_made = 0
