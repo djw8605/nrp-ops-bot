@@ -241,16 +241,31 @@ stream itself an injection and exfiltration surface).
 Socket Mode only. There is no public ingress and no request-signature endpoint, so the bot needs no
 inbound network path at all.
 
-1. Create an app at <https://api.slack.com/apps> → *From scratch*.
-2. **Socket Mode** → enable. Generate an app-level token with `connections:write` → `xapp-…`.
-3. **OAuth & Permissions** → bot token scopes, and *nothing more*:
-   - `app_mentions:read` — see mentions
-   - `chat:write` — post and edit replies
-   - `im:history` — read DMs the bot is in
-   - `reactions:write` — react to denied messages
-4. **Event Subscriptions** → subscribe to bot events: `app_mention`, `message.im`.
-5. Install to the workspace → `xoxb-…`.
-6. Put both tokens in a Kubernetes Secret; the Deployment consumes them via `envFrom`.
+Fastest path — <https://api.slack.com/apps> → *Create New App* → **From an app manifest**, pick the
+NRP workspace, and paste [`slack/app-manifest.yaml`](slack/app-manifest.yaml). That sets the scopes,
+the event subscriptions and Socket Mode in one step.
+
+Then collect the two tokens, **which live on two different pages**:
+
+| Token | Where | Notes |
+|---|---|---|
+| `xapp-…` | **Basic Information → App-Level Tokens** → *Generate Token and Scopes*, scope `connections:write` | A manifest cannot mint tokens, so this step is always manual |
+| `xoxb-…` | *Install to Workspace*, then **OAuth & Permissions → Bot User OAuth Token** | Does not exist until the app is installed |
+
+> **If you cannot find the app-level token:** it is not under *OAuth & Permissions*, which is where
+> every other Slack token lives — that is the usual reason it seems missing. It is on **Basic
+> Information**, below *App Credentials*, and it does not exist until you generate one. Toggling
+> **Settings → Socket Mode** on also offers to create it inline, which is the easier route. You can
+> reopen the value later by clicking the token's name; it is not show-once.
+
+Finally you need the workspace **team ID** (`T…`) for `NRP_OPS_SLACK_TEAM_ID`, and the operators'
+Slack **user IDs** for `deploy/configmap-allowlist.yaml` — profile → `…` → *Copy member ID*. Both
+tokens go into the sealed Secret; the Deployment consumes them via `envFrom`.
+
+Doing it by hand instead: *From scratch*, then Socket Mode → enable and generate the app token;
+**OAuth & Permissions** → bot scopes `app_mentions:read`, `chat:write`, `im:history`,
+`reactions:write` and nothing more; **Event Subscriptions** → bot events `app_mention` and
+`message.im`; install to the workspace.
 
 Not requested, deliberately: `channels:history`, `groups:history`, `users:read`, `files:read`. The
 agent authorizes on user ID and does not need the directory.
