@@ -1,5 +1,15 @@
 ---
-# Rebuilds the documentation FTS5 index every 6 hours onto the shared PVC.
+# Rebuilds the documentation FTS5 index hourly onto the shared PVC.
+#
+# Hourly is affordable because a run is a `git clone --depth 1 --single-branch`
+# of one docs repo (~870 chunks) and a full rebuild, not an incremental diff --
+# roughly a minute of one CPU. The previous 6-hourly schedule meant an operator
+# could read a runbook edited that morning and get the pre-edit text back with a
+# confident nrp.ai citation, which is worse than a miss.
+#
+# concurrencyPolicy: Forbid plus activeDeadlineSeconds well under the interval
+# is what keeps hourly from stacking up: a slow run is killed at 30 minutes and
+# a run still going at the next tick suppresses it rather than doubling up.
 #
 # The build is atomic: chunks go into <db>.building and the file is renamed over
 # the live index only on success, so the agent never reads a half-built database.
@@ -14,7 +24,8 @@ metadata:
     app.kubernetes.io/name: nrp-ops-agent
     app.kubernetes.io/component: docs-sync
 spec:
-  schedule: "17 */6 * * *"  # offset from the hour to avoid the cluster-wide cron spike
+  # Offset from the hour to avoid the cluster-wide cron spike at :00.
+  schedule: "17 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3

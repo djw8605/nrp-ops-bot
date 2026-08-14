@@ -128,6 +128,9 @@ crawl the rendered HTML, which loses heading structure and reflows code blocks.
   indexed, and the admin guide is the one that holds the actual runbooks
 - Built atomically into `<db>.building` and renamed on success, so the agent never reads a
   half-built index. A checkout yielding zero chunks is a failure, not an empty index
+- Rebuilt hourly at `:17` by `deploy/cronjob-docs-sync.yaml`, so the worst case is a runbook edit
+  the bot cites in its pre-edit form for under an hour. A run is a shallow clone and a full rebuild
+  — about a minute — so the schedule is bounded by politeness to the docs repo, not by cost
 
 `Retriever` is the seam for embeddings later. Phase 1 is BM25 only — exact-term matching beats pure
 vector search on a corpus this full of identifiers. Retrieval quality is pinned by ten operator-style
