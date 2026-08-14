@@ -26,8 +26,15 @@ data:
     # An empty list denies everyone. So does a list of placeholders, which looks
     # identical from the outside: the bot connects, logs authz_deny, and answers
     # nobody.
+    # Names are comments for whoever edits this next; only the IDs are read.
+    # Removing someone here takes effect on the next mtime poll -- no redeploy,
+    # and no restart needed.
     operators:
-      - U00000000000  # TODO: replace with real operator IDs before deploying
+      - U0B2EJ5Q760  # Derek
+      - U0B2EJ6FAGL  # Daniel
+      - U0B2EEL3R7W  # Sam
+      - U0B27J7018D  # Huijun
+      - U0B27J4PM29  # Ashton
 
     # WHERE @mentions are honoured, as a second gate on top of `operators`.
     # A channel mention needs BOTH: an allowlisted user in an allowlisted
@@ -44,7 +51,7 @@ data:
     # `/invite @nrp-ops` there -- otherwise the mention never arrives and the
     # audit log shows nothing at all, not even a denial.
     channels:
-      - C00000000000  # TODO: replace with the ops channel ID
+      - C0B1VGA726T  # the ops channel -- remember `/invite @nrp-ops` here
 
     # fnmatch globs. Deny-by-default: a namespace matching nothing here is
     # refused inside the tool, before any API call is made.
