@@ -26,10 +26,13 @@ namespaces:
   - "rook"
   - "rook-*"
   - gpu-operator
+  # The bot's own namespace, for self-triage. Listed explicitly because this
+  # file is enumerated where the deployed policy uses `*`; removing it from
+  # `namespaces_denied` alone would not have been enough to make it readable.
+  - system-nrp-ops-bot
 
 namespaces_denied:
   - kube-system
   - kube-public
   - kube-node-lease
   - cert-manager
-  - system-nrp-ops-bot

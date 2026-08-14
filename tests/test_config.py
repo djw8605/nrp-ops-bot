@@ -83,6 +83,19 @@ class TestAllowlistNamespaceMatching:
         assert policy.namespace_allowed("kube-system") is False
         assert policy.namespace_allowed("Kube-System") is True  # different namespace entirely
 
+    def test_decision_distinguishes_denylist_from_missing_allowlist(self) -> None:
+        """The two denials need different operator fixes, so they are different
+        outcomes rather than one shared False."""
+        policy = Allowlist(namespaces=["coder"], namespaces_denied=["kube-system"])
+        assert policy.namespace_decision("coder") == "allowed"
+        assert policy.namespace_decision("kube-system") == "denylisted"
+        assert policy.namespace_decision("some-tenant") == "not_allowlisted"
+        assert policy.namespace_decision("coder/pods") == "malformed"
+
+    def test_denylist_outranks_a_wildcard_allowlist_in_the_decision(self) -> None:
+        policy = Allowlist(namespaces=["*"], namespaces_denied=["kube-system"])
+        assert policy.namespace_decision("kube-system") == "denylisted"
+
     def test_extra_keys_are_rejected(self) -> None:
         with pytest.raises(ValueError, match="admins"):
             Allowlist.model_validate({"operators": ["U1"], "admins": ["U2"]})

@@ -205,6 +205,17 @@ namespaces_denied:  # wins over `namespaces` even on an exact match
   - kube-system
 ```
 
+A refused namespace says which of the two gates stopped it, because the fixes differ: *"explicitly
+denied by policy"* means an entry in `namespaces_denied` matched and needs removing there, while
+*"not in the configured allowlist"* means nothing in `namespaces` matched and needs adding. With the
+shipped `namespaces: ["*"]`, only the first can happen.
+
+The bot's own namespace, `system-nrp-ops-bot`, is readable — it was denied until 2026-08-14, which
+made self-triage ("why am I crashlooping?") fail with a message that read like an out-of-scope
+tenant. That means the agent can read its own pod logs (the audit trail, before `redact.py` scrubs
+it on the way to Slack) and its own ConfigMap (the operator and channel IDs). Both stay behind
+`operators`; re-add the namespace to `namespaces_denied` to reverse it.
+
 #### Restricting the bot to specific people
 
 `operators` is the control that does this. It is checked **before** the channel list and applies to

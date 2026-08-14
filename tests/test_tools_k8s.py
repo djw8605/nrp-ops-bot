@@ -232,6 +232,20 @@ class TestNamespaceEnforcement:
         assert result.content["error"] == "namespace_denied"
         assert fake_kube.core.calls == []
 
+    @pytest.mark.usefixtures("allow_all_namespaces")
+    async def test_denial_message_names_the_denylist(self, fake_kube: Any) -> None:
+        """A denylisted namespace must not read as a missing allowlist entry --
+        the two need different fixes from whoever edits the ConfigMap."""
+        result = await dispatch("list_pods", {"namespace": "kube-system"})
+        assert "namespaces_denied" in result.content["message"]
+        assert "not in the configured allowlist" not in result.content["message"]
+
+    @pytest.mark.usefixtures("allow_coder_only")
+    async def test_out_of_scope_message_points_at_the_allowlist(self, fake_kube: Any) -> None:
+        result = await dispatch("list_pods", {"namespace": "some-tenant"})
+        assert "not in the configured allowlist" in result.content["message"]
+        assert "namespaces_denied" not in result.content["message"]
+
     @pytest.mark.parametrize("tool", ["list_pods", "get_events"])
     @pytest.mark.usefixtures("allow_coder_only")
     async def test_every_namespaced_tool_checks(self, fake_kube: Any, tool: str) -> None:

@@ -71,9 +71,19 @@ data:
     # With `namespaces: ["*"]` above, this is the entire boundary rather than a
     # backstop -- it wins over `namespaces` even on an exact match. Add any
     # namespace whose pod logs should stay unreadable.
+    #
+    # `system-nrp-ops-bot` -- the bot's own namespace -- was denied here until
+    # 2026-08-14, so self-triage ("why am I crashlooping?") failed with the same
+    # message as a genuinely out-of-scope tenant. It is now readable, which is
+    # deliberate and has two consequences worth knowing:
+    #   * the bot can read its own pod logs, i.e. the audit trail, which is the
+    #     pre-redaction side of what `redact.py` scrubs on the way out to Slack;
+    #   * it can read its own Deployment and this ConfigMap, so the operator IDs
+    #     and channel IDs above are reachable via a k8s tool call.
+    # Both are bounded by `operators` -- only allowlisted humans get answers at
+    # all. Re-add the namespace below to reverse this.
     namespaces_denied:
       - kube-system
       - kube-public
       - kube-node-lease
       - cert-manager
-      - system-nrp-ops-bot

@@ -191,8 +191,9 @@ async def aclose_clients() -> None:
 
 def _require_namespace(namespace: str) -> str:
     """Deny-by-default namespace gate, called inside every namespaced tool."""
-    if not get_allowlist_loader().load().namespace_allowed(namespace):
-        raise NamespaceDenied(namespace)
+    decision = get_allowlist_loader().load().namespace_decision(namespace)
+    if decision != "allowed":
+        raise NamespaceDenied(namespace, decision)
     return namespace
 
 

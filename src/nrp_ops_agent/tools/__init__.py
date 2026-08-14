@@ -41,13 +41,36 @@ class ToolError(Exception):
         self.message = message
 
 
+#: Why a namespace was refused -> what to tell the model. The distinction matters
+#: to whoever reads the reply: an explicitly denied namespace needs a denylist
+#: edit, an out-of-scope one needs an allowlist entry, and a malformed one is
+#: usually the model's own typo and worth one corrected retry.
+_DENIAL_REASONS: Final[dict[str, str]] = {
+    "denylisted": (
+        "is explicitly denied by policy (it matches an entry in `namespaces_denied`, "
+        "which wins over the allowlist even when that allows everything)"
+    ),
+    "not_allowlisted": "is not in the configured allowlist (`namespaces`)",
+    "malformed": (
+        "is not a well-formed namespace name -- it must be non-empty, unpadded, and contain no '/'"
+    ),
+}
+
+
 class NamespaceDenied(ToolError):
-    def __init__(self, namespace: str) -> None:
-        super().__init__(
-            "namespace_denied",
-            f"Namespace {namespace!r} is not in the configured allowlist. "
-            "This is a policy decision and cannot be overridden from a message.",
+    """Raised by the namespace gate. ``reason`` selects the explanation."""
+
+    def __init__(self, namespace: str, reason: str = "not_allowlisted") -> None:
+        explanation = _DENIAL_REASONS.get(reason, _DENIAL_REASONS["not_allowlisted"])
+        retry = (
+            "Fix the name and try once more."
+            if reason == "malformed"
+            else "This is a policy decision and cannot be overridden from a message, so "
+            "do not retry this namespace -- report it as out of scope and move on."
         )
+        super().__init__("namespace_denied", f"Namespace {namespace!r} {explanation}. {retry}")
+        self.namespace = namespace
+        self.reason = reason
 
 
 Handler = Callable[[Any], Awaitable[dict[str, Any]]]

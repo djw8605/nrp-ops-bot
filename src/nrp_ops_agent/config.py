@@ -28,6 +28,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 KubeMode = Literal["auto", "incluster", "kubeconfig"]
 
+NamespaceDecision = Literal["allowed", "denylisted", "not_allowlisted", "malformed"]
+"""Outcome of :meth:`Allowlist.namespace_decision`. Only ``allowed`` permits a call."""
+
 
 class Settings(BaseSettings):
     """Static, env-driven configuration. Constructed once via :func:`get_settings`."""
@@ -203,13 +206,25 @@ class Allowlist(BaseModel):
             return tuple(str(x).strip() for x in v if str(x).strip())
         return v
 
+    def namespace_decision(self, namespace: str) -> NamespaceDecision:
+        """Deny-by-default namespace check, with *why* attached.
+
+        The reason is not cosmetic: "denied by policy" and "not in scope" are
+        different operator actions (remove a denylist entry vs. add an allowlist
+        entry), and a single message for both made a self-deny on the bot's own
+        namespace read as a missing allowlist entry.
+        """
+        if not namespace or "/" in namespace or namespace != namespace.strip():
+            return "malformed"
+        if any(fnmatch.fnmatchcase(namespace, pat) for pat in self.namespaces_denied):
+            return "denylisted"
+        if any(fnmatch.fnmatchcase(namespace, pat) for pat in self.namespaces):
+            return "allowed"
+        return "not_allowlisted"
+
     def namespace_allowed(self, namespace: str) -> bool:
         """Deny-by-default namespace check. Denylist wins over the allowlist."""
-        if not namespace or "/" in namespace or namespace != namespace.strip():
-            return False
-        if any(fnmatch.fnmatchcase(namespace, pat) for pat in self.namespaces_denied):
-            return False
-        return any(fnmatch.fnmatchcase(namespace, pat) for pat in self.namespaces)
+        return self.namespace_decision(namespace) == "allowed"
 
 
 class AllowlistLoader:
