@@ -7,9 +7,14 @@
 # There is no ingress rule at all: Socket Mode means Slack connects outbound
 # from this pod, so nothing ever needs to reach it.
 #
-# TODO: verify the CIDRs and ports below against this cluster -- the API server
-# endpoint, the Thanos/Prometheus address and the LLM gateway address all depend
-# on how NRP is wired, and a too-narrow policy fails as a confusing timeout.
+# The API server rule below was verified against this cluster on 2026-08-14
+# (see the comment on that rule). Thanos and the LLM gateway are still covered
+# only by the broad public-HTTPS rule at the bottom, which is known to work but
+# is wider than it needs to be.
+#
+# A too-narrow rule here fails as a 30s timeout on every tool call, never as an
+# error naming the network -- so suspect this file first when the agent can
+# reach the LLM but not Kubernetes.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -43,10 +48,42 @@ spec:
         - protocol: TCP
           port: 53
 
-    # Kubernetes API server. Cluster-internal ClusterIP for the default service.
+    # Kubernetes API server.
+    #
+    # Verified 2026-08-14 against this cluster:
+    #   svc/kubernetes  ClusterIP 10.96.0.1, port 443 -> targetPort 6443
+    #   endpoints       67.58.53.147, 67.58.53.150, 67.58.53.151 on port 6443
+    #
+    # The CNI here is Calico, which evaluates egress policy AFTER kube-proxy has
+    # DNAT'd the ClusterIP. The destination the policy sees is therefore an
+    # ENDPOINT -- 67.58.53.x:6443 -- not 10.96.0.1:443, so the endpoints and port
+    # 6443 are what must be permitted. The previous rule named neither (it had
+    # the k3s default 10.43.0.1 on port 443) and every API call died as a 30s
+    # timeout: a drop, not a refusal, which is why it looked like a hung API
+    # rather than a policy problem. Note the broad public rule below does NOT
+    # cover this -- these are public IPs, but that rule only opens port 443.
+    #
+    # These are control-plane node addresses, so they can change when the
+    # control plane is re-addressed or a node is replaced. If the agent starts
+    # timing out on every Kubernetes tool again, re-check:
+    #   kubectl -n default get endpoints kubernetes
     - to:
         - ipBlock:
-            cidr: 10.43.0.1/32  # TODO: verify -- `kubectl get svc kubernetes -o wide`
+            cidr: 67.58.53.147/32
+        - ipBlock:
+            cidr: 67.58.53.150/32
+        - ipBlock:
+            cidr: 67.58.53.151/32
+      ports:
+        - protocol: TCP
+          port: 6443
+
+    # Kept for CNIs that match pre-DNAT, where the ClusterIP is what the policy
+    # sees. Harmless under Calico, and it stops this from breaking if the
+    # cluster's kube-proxy mode or CNI changes.
+    - to:
+        - ipBlock:
+            cidr: 10.96.0.1/32
       ports:
         - protocol: TCP
           port: 443
