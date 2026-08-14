@@ -45,4 +45,4 @@ resources:
 images:
   - name: ghcr.io/nrp/nrp-ops-agent
     newName: ghcr.io/djw8605/nrp-ops-bot
-    newTag: sha-a57823d
+    newTag: sha-f615424
