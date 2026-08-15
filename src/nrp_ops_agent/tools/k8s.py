@@ -131,6 +131,7 @@ class KubeClients:
 
     core: Any
     apps: Any
+    batch: Any = None
 
 
 _clients_singleton: KubeClients | None = None
@@ -167,7 +168,9 @@ async def _clients() -> KubeClients:
         await _load_kube_config()
         api = kube_client.ApiClient()
         _clients_singleton = KubeClients(
-            core=kube_client.CoreV1Api(api), apps=kube_client.AppsV1Api(api)
+            core=kube_client.CoreV1Api(api),
+            apps=kube_client.AppsV1Api(api),
+            batch=kube_client.BatchV1Api(api),
         )
     return _clients_singleton
 
@@ -661,6 +664,90 @@ async def get_workload(args: GetWorkloadArgs) -> dict[str, Any]:
         "images": [
             {"container": _g(c, "name"), "image": _g(c, "image")}
             for c in _g(obj, "spec", "template", "spec", "containers") or []
+        ],
+    }
+    return scrub_k8s_fields(result)  # type: ignore[no-any-return]
+
+
+# --------------------------------------------------------------------------- #
+# CronJobs
+# --------------------------------------------------------------------------- #
+
+
+class GetCronJobArgs(_Args):
+    namespace: Namespace
+    name: ResourceName
+    job_limit: Annotated[int, Field(ge=1, le=20)] = 5
+
+
+@make_tool(
+    "get_cronjob",
+    "Schedule and recent run outcomes for a CronJob: the cron expression, last "
+    "schedule and successful times, whether it is suspended, and the most recent "
+    "Jobs it created with their succeeded/failed counts and the pod names to pull "
+    "logs from. Use this for 'did the cron job run' and 'why did it fail' -- "
+    "get_workload does not cover CronJobs.",
+    GetCronJobArgs,
+)
+async def get_cronjob(args: GetCronJobArgs) -> dict[str, Any]:
+    _require_namespace(args.namespace)
+    clients = await _clients()
+    try:
+        obj = await clients.batch.read_namespaced_cron_job(name=args.name, namespace=args.namespace)
+    except Exception as exc:
+        raise _wrap_api_error(exc) from exc
+
+    spec, status = _g(obj, "spec"), _g(obj, "status")
+    uid = _g(obj, "metadata", "uid")
+
+    # Jobs are matched by ownerReference rather than by name prefix: a Job named
+    # <cronjob>-29779157 looks like a child but nothing stops an unrelated Job
+    # from being named that way, and the owner reference is what Kubernetes
+    # itself uses.
+    jobs: list[dict[str, Any]] = []
+    try:
+        listed = await clients.batch.list_namespaced_job(namespace=args.namespace)
+    except Exception as exc:
+        raise _wrap_api_error(exc) from exc
+
+    owned = [
+        job
+        for job in _g(listed, "items") or []
+        if any(_g(ref, "uid") == uid for ref in _g(job, "metadata", "owner_references") or [])
+    ]
+    owned.sort(key=lambda j: str(_g(j, "metadata", "creation_timestamp") or ""), reverse=True)
+
+    for job in owned[: args.job_limit]:
+        job_status = _g(job, "status")
+        jobs.append(
+            {
+                "name": _g(job, "metadata", "name"),
+                "age_seconds": _age_seconds(_g(job, "metadata", "creation_timestamp")),
+                "active": _g(job_status, "active") or 0,
+                "succeeded": _g(job_status, "succeeded") or 0,
+                "failed": _g(job_status, "failed") or 0,
+                "conditions": _conditions(job),
+            }
+        )
+
+    result: dict[str, Any] = {
+        "kind": "cronjob",
+        "namespace": args.namespace,
+        "name": args.name,
+        "schedule": _g(spec, "schedule"),
+        "suspended": bool(_g(spec, "suspend")),
+        "concurrency_policy": _g(spec, "concurrency_policy"),
+        # A Job whose pods are gone takes its logs with it. Surfacing the policy
+        # here is what turns "logs return not_found" from a mystery into an
+        # explanation.
+        "restart_policy": _g(spec, "job_template", "spec", "template", "spec", "restart_policy"),
+        "last_schedule_time": _g(status, "last_schedule_time"),
+        "last_successful_time": _g(status, "last_successful_time"),
+        "active_jobs": len(_g(status, "active") or []),
+        "recent_jobs": jobs,
+        "images": [
+            {"container": _g(c, "name"), "image": _g(c, "image")}
+            for c in _g(spec, "job_template", "spec", "template", "spec", "containers") or []
         ],
     }
     return scrub_k8s_fields(result)  # type: ignore[no-any-return]

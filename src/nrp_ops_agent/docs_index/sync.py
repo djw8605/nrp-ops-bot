@@ -1,6 +1,6 @@
 """Clone the NRP docs site, chunk its MDX, and build a SQLite FTS5 index.
 
-Run by ``deploy/cronjob-docs-sync.yaml`` every 6 hours into a PVC.
+Run hourly by ``deploy/cronjob-docs-sync.yaml`` into a PVC.
 
 Design notes:
 
@@ -296,12 +296,41 @@ def build_index(chunks: list[Chunk], db_path: Path) -> int:
     return len(chunks)
 
 
+class CloneFailed(RuntimeError):
+    """git clone failed, carrying git's own stderr rather than just a status."""
+
+
 def clone_docs(repo_url: str, dest: Path, ref: str | None = None) -> Path:
+    """Shallow-clone the docs repo.
+
+    ``check=True`` used to raise ``CalledProcessError``, whose message is only
+    "returned non-zero exit status 128" -- git's stderr was captured and then
+    thrown away with the exception. In the CronJob that meant a failed run left
+    a traceback naming no cause: not the DNS failure, not the TLS error, not the
+    404. Everything below exists to put git's own words in the log.
+    """
     cmd = ["git", "clone", "--depth", "1", "--single-branch"]
     if ref:
         cmd += ["--branch", ref]
     cmd += [repo_url, str(dest)]
-    subprocess.run(cmd, check=True, capture_output=True, timeout=600)  # noqa: S603
+
+    print(f"cloning {repo_url}" + (f" at {ref}" if ref else ""), file=sys.stderr, flush=True)
+    try:
+        proc = subprocess.run(  # noqa: S603
+            cmd, check=False, capture_output=True, timeout=600, text=True
+        )
+    except subprocess.TimeoutExpired as exc:
+        # A drop rather than a refusal: almost always egress policy. A refusal
+        # would have come back as a fast non-zero exit instead.
+        raise CloneFailed(
+            f"git clone of {repo_url} timed out after 600s with no response. This is what a "
+            "blocked egress path looks like -- check the NetworkPolicy allows HTTPS to the "
+            "docs host, and that the host resolves."
+        ) from exc
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or "(git wrote nothing to stderr)"
+        raise CloneFailed(f"git clone of {repo_url} failed with exit {proc.returncode}:\n{detail}")
     return dest
 
 
@@ -327,13 +356,18 @@ def sync(
 
         docs_root = checkout / DOCS_SUBDIR
         if not docs_root.is_dir():
-            raise FileNotFoundError(f"{DOCS_SUBDIR} not found in checkout at {checkout}")
+            present = sorted(p.name for p in checkout.iterdir())[:20] if checkout.is_dir() else []
+            raise FileNotFoundError(
+                f"{DOCS_SUBDIR} not found in checkout at {checkout}. Top level holds: "
+                f"{', '.join(present) or '(nothing)'}. The docs repo layout may have moved."
+            )
 
         chunks = list(iter_chunks(docs_root, site_base_url))
         if not chunks:
             raise RuntimeError(
                 "docs checkout produced zero chunks; refusing to publish an empty index"
             )
+        print(f"chunked {len(chunks)} sections, writing {db_path}", file=sys.stderr, flush=True)
         return build_index(chunks, db_path)
     finally:
         if tmpdir:
@@ -353,13 +387,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    count = sync(
-        repo_url=args.repo_url,
-        db_path=args.db_path,
-        site_base_url=args.site_base_url,
-        local_checkout=args.local_checkout,
-    )
-    print(f"indexed {count} chunks", file=sys.stderr)
+    try:
+        count = sync(
+            repo_url=args.repo_url,
+            db_path=args.db_path,
+            site_base_url=args.site_base_url,
+            local_checkout=args.local_checkout,
+        )
+    except Exception as exc:
+        # The last line of a crashlooping container's log is the one anybody
+        # actually reads, so put the reason there rather than at the top of a
+        # traceback. Non-zero exit still fails the Job.
+        print(f"docs-sync failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return 1
+
+    print(f"indexed {count} chunks", file=sys.stderr, flush=True)
     return 0
 
 

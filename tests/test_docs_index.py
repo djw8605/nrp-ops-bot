@@ -10,14 +10,19 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from helpers import ns
+from nrp_ops_agent.docs_index import sync as sync_module
 from nrp_ops_agent.docs_index.sync import (
+    CloneFailed,
     build_index,
     chunk_by_heading,
+    clone_docs,
     iter_chunks,
     section_for,
     split_frontmatter,
@@ -265,6 +270,52 @@ class TestIndexBuild:
 
     def test_build_index_accepts_an_empty_list(self, tmp_path: Path) -> None:
         assert build_index([], tmp_path / "empty.sqlite3") == 0
+
+
+class TestCloneFailureIsLegible:
+    """The CronJob crashlooped and left nothing to read: `check=True` raised
+    CalledProcessError, whose message is only an exit status, and git's stderr
+    went into the exception and never to the log."""
+
+    def test_git_stderr_reaches_the_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            return ns(
+                returncode=128,
+                stdout="",
+                stderr="fatal: unable to access 'https://gitlab...': Could not resolve host",
+            )
+
+        monkeypatch.setattr(sync_module.subprocess, "run", fake_run)
+        with pytest.raises(CloneFailed, match="Could not resolve host"):
+            clone_docs("https://gitlab.nrp-nautilus.io/prp/nrp-site.git", tmp_path / "co")
+
+    def test_a_timeout_names_the_likely_cause(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            raise subprocess.TimeoutExpired(cmd, 600)
+
+        monkeypatch.setattr(sync_module.subprocess, "run", fake_run)
+        with pytest.raises(CloneFailed, match="egress"):
+            clone_docs("https://gitlab.nrp-nautilus.io/prp/nrp-site.git", tmp_path / "co")
+
+    def test_main_exits_nonzero_with_the_reason_on_the_last_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def boom(**kwargs: Any) -> int:
+            raise CloneFailed("Could not resolve host gitlab.nrp-nautilus.io")
+
+        monkeypatch.setattr(sync_module, "sync", boom)
+        assert sync_module.main(["--db-path", str(tmp_path / "x.sqlite3")]) == 1
+        assert "Could not resolve host" in capsys.readouterr().err.strip().splitlines()[-1]
+
+    def test_a_missing_docs_dir_names_what_was_there_instead(self, tmp_path: Path) -> None:
+        checkout = tmp_path / "co"
+        (checkout / "website").mkdir(parents=True)
+        with pytest.raises(FileNotFoundError, match="website"):
+            sync(db_path=tmp_path / "x.sqlite3", local_checkout=checkout)
 
 
 # --------------------------------------------------------------------------- #

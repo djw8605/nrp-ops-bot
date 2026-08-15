@@ -68,6 +68,17 @@ rules:
       - replicasets/status
     verbs: ["get", "list", "watch"]
 
+  # CronJob and Job status, for "did the nightly sync run, and did it work".
+  # Read-only like everything else: the agent can see that a Job failed and name
+  # the pod to pull logs from, but cannot create, re-run, suspend or delete one.
+  - apiGroups: ["batch"]
+    resources:
+      - cronjobs
+      - cronjobs/status
+      - jobs
+      - jobs/status
+    verbs: ["get", "list", "watch"]
+
   # Ingress objects explain "the service is up but users get a 503".
   - apiGroups: ["networking.k8s.io"]
     resources:

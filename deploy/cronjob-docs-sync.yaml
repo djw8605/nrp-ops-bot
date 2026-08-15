@@ -40,7 +40,17 @@ spec:
             app.kubernetes.io/name: nrp-ops-agent
             app.kubernetes.io/component: docs-sync
         spec:
-          restartPolicy: OnFailure
+          # Never, not OnFailure. Under OnFailure the kubelet restarts the
+          # container inside one pod, and when the Job gives up it deletes that
+          # pod -- taking every log with it. A failed run then leaves nothing to
+          # read but "BackoffLimitExceeded", which is what happened on
+          # 2026-08-15: the job failed four times and no one could see why.
+          #
+          # Never gives each attempt its own pod, and failed pods are retained
+          # (Failed phase) until failedJobsHistoryLimit reaps the Job. Logs are
+          # then reachable with:
+          #   kubectl -n system-nrp-ops-bot logs job/<name>
+          restartPolicy: Never
           # No ServiceAccount token: this job talks to GitLab and the PVC only,
           # and has no business reaching the Kubernetes API.
           automountServiceAccountToken: false

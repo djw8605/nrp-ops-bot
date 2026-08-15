@@ -45,12 +45,13 @@ def allow_coder_only(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def fake_kube(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Install fake core/apps clients; tests populate the canned responses."""
+    """Install fake core/apps/batch clients; tests populate the canned responses."""
     from nrp_ops_agent.tools import k8s
 
     core = FakeApi()
     apps = FakeApi()
-    clients = k8s.KubeClients(core=core, apps=apps)
+    batch = FakeApi()
+    clients = k8s.KubeClients(core=core, apps=apps, batch=batch)
 
     async def _fake_clients() -> k8s.KubeClients:
         return clients

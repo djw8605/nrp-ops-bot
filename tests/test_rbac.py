@@ -103,9 +103,11 @@ METHOD_TO_RESOURCE = {
     "read_namespaced_replica_set": "replicasets",
     "read_namespaced_service": "services",
     "read_namespaced_ingress": "ingresses",
+    "read_namespaced_cron_job": "cronjobs",
+    "list_namespaced_job": "jobs",
 }
 
-_CALL = re.compile(r"clients\.(?:core|apps)\.(\w+)|\"(read_namespaced_\w+)\"")
+_CALL = re.compile(r"clients\.(?:core|apps|batch)\.(\w+)|\"(read_namespaced_\w+)\"")
 
 
 def _called_methods() -> set[str]:

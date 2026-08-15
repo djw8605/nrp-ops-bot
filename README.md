@@ -98,6 +98,7 @@ Nine tools, all read-only. Out-of-range arguments are **rejected**, never silent
 | `get_logs(namespace, pod, container?, tail_lines=200, since_seconds=1800, previous=false)` | `tail_lines` ≤ 1000; total output capped at 96 KB, keeping the tail |
 | `get_events(namespace, since_seconds=3600, involved_object?, limit=50)` | newest first |
 | `get_workload(kind, namespace, name)` | deployment/statefulset/daemonset/replicaset; reports `generation` vs `observedGeneration` |
+| `get_cronjob(namespace, name, job_limit=5)` | schedule, last success, and recent Jobs with their failure conditions and `restartPolicy` |
 | `get_node(name)` | conditions, taints, capacity vs allocatable. Labels deliberately omitted |
 | `list_nodes(label_selector?, only_unhealthy=true)` | NRP has hundreds of nodes; healthy ones are never the answer |
 | `promql(query, lookback="1h", step?)` | omit `step` for instant, set it for range. Series and sample caps enforced |

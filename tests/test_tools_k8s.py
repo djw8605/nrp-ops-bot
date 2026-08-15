@@ -15,6 +15,7 @@ from helpers import ApiException, ago, ns
 from nrp_ops_agent.tools import dispatch, registry
 from nrp_ops_agent.tools import k8s as k8s_tools
 from nrp_ops_agent.tools.k8s import (
+    GetCronJobArgs,
     GetEventsArgs,
     GetLogsArgs,
     GetNodeArgs,
@@ -22,6 +23,7 @@ from nrp_ops_agent.tools.k8s import (
     GetWorkloadArgs,
     ListNodesArgs,
     ListPodsArgs,
+    get_cronjob,
     get_events,
     get_logs,
     get_node,
@@ -530,6 +532,98 @@ class TestGetWorkload:
         assert result.ok is False
         assert result.content["error"] == "invalid_arguments"
         assert fake_kube.apps.calls == []
+        # A CronJob is not a workload kind here -- it has its own tool, because
+        # it has no replicas and no observedGeneration to report.
+        assert "get_cronjob" in registry()
+
+
+@allow_all
+class TestGetCronJob:
+    """`get_workload(kind='cronjob')` was the only thing on offer and it just
+    returned invalid_arguments, so "did the docs sync run?" was unanswerable."""
+
+    def _cronjob(self, **status: Any) -> Any:
+        base = {"last_schedule_time": ago(600), "last_successful_time": None, "active": []}
+        base.update(status)
+        return ns(
+            metadata=ns(uid="uid-1", creation_timestamp=ago(86400)),
+            spec=ns(
+                schedule="17 * * * *",
+                suspend=False,
+                concurrency_policy="Forbid",
+                job_template=ns(
+                    spec=ns(
+                        template=ns(
+                            spec=ns(
+                                restart_policy="Never",
+                                containers=[ns(name="docs-sync", image="nrp/agent:1")],
+                            )
+                        )
+                    )
+                ),
+            ),
+            status=ns(**base),
+        )
+
+    def _job(self, name: str, *, uid: str = "uid-1", **status: Any) -> Any:
+        base: dict[str, Any] = {"active": 0, "succeeded": 0, "failed": 0, "conditions": []}
+        base.update(status)
+        return ns(
+            metadata=ns(
+                name=name,
+                creation_timestamp=ago(600),
+                owner_references=[ns(uid=uid, kind="CronJob")],
+            ),
+            status=ns(**base),
+        )
+
+    async def test_reports_schedule_and_failed_runs(self, fake_kube: Any) -> None:
+        fake_kube.batch._responses["read_namespaced_cron_job"] = self._cronjob()
+        fake_kube.batch._responses["list_namespaced_job"] = ns(
+            items=[
+                self._job(
+                    "docs-sync-29779157",
+                    failed=4,
+                    conditions=[
+                        ns(
+                            type="Failed",
+                            status="True",
+                            reason="BackoffLimitExceeded",
+                            message="Job has reached the specified backoff limit",
+                            last_transition_time=ago(300),
+                        )
+                    ],
+                )
+            ]
+        )
+        out = await get_cronjob(GetCronJobArgs(namespace="coder", name="docs-sync"))
+
+        assert out["schedule"] == "17 * * * *"
+        assert out["suspended"] is False
+        assert out["last_successful_time"] is None
+        assert out["recent_jobs"][0]["failed"] == 4
+        assert out["recent_jobs"][0]["conditions"][0]["reason"] == "BackoffLimitExceeded"
+        # Surfaced so "the logs are gone" has a visible cause rather than
+        # looking like the pod never existed.
+        assert out["restart_policy"] == "Never"
+
+    async def test_only_jobs_this_cronjob_owns_are_reported(self, fake_kube: Any) -> None:
+        """Name prefixes are not ownership: an unrelated Job can be named to
+        look like a child, and the owner reference is what actually decides."""
+        fake_kube.batch._responses["read_namespaced_cron_job"] = self._cronjob()
+        fake_kube.batch._responses["list_namespaced_job"] = ns(
+            items=[
+                self._job("docs-sync-29779157", succeeded=1),
+                self._job("docs-sync-imposter", uid="uid-other", succeeded=1),
+            ]
+        )
+        out = await get_cronjob(GetCronJobArgs(namespace="coder", name="docs-sync"))
+        assert [j["name"] for j in out["recent_jobs"]] == ["docs-sync-29779157"]
+
+    async def test_namespace_allowlist_applies(self, fake_kube: Any, allow_coder_only: Any) -> None:
+        result = await dispatch("get_cronjob", {"namespace": "kube-system", "name": "x"})
+        assert result.content["error"] == "namespace_denied"
+        assert fake_kube.batch.calls == []
 
 
 # --------------------------------------------------------------------------- #
