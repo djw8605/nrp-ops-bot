@@ -40,7 +40,7 @@ a control.
 | ServiceAccount | token mounted, read-only ClusterRole | `automountServiceAccountToken: false`, **no ClusterRole, no binding** |
 | Egress | API server, Thanos, LLM, Slack | LLM, Slack, GitLab (docs clone) — **no API server, no Thanos** |
 | Docs index | `userdocs` + `admindocs` | `userdocs` only (separate index build) |
-| Silence on refusal | reaction, no text | nothing at all |
+| Silence on refusal | reaction, no text | nothing in channel; one fixed line in a DM |
 | Slack app | `nrp-ops` | separate app, separate tokens, separate scopes |
 
 Separate Slack apps rather than one app in two channels: the scopes differ, the identities should
@@ -103,6 +103,35 @@ That makes channel membership the real consent boundary, and it deserves to be t
 Events dropped in code before anything else runs: bot messages (including its own), `subtype`-bearing
 messages (joins, topic changes, `message_changed`, `message_deleted`), empty text, wrong team ID,
 messages in threads the bot is not participating in where a human has already replied.
+
+### DMs answer exactly as a channel does
+
+A DM runs the same pipeline, against the same index, at the same confidence bar, and produces the
+same answer with the same citations. There is no separate DM path, no relaxed threshold because "it's
+only one person", and no tightened one either. `message.im` and `message.channels` converge on one
+handler after G0; the only thing that differs is where the reply goes.
+
+The bar must not move in either direction, and both temptations are worth naming because both are
+plausible:
+
+- **Lowering it in DMs** ("a wrong answer only costs one person") is wrong because a DM answer is
+  *less* supervised, not more. In a channel an admin may see a bad answer and correct it. In a DM
+  nobody ever will, and the user acts on it.
+- **Raising it in DMs** is wrong because the user deliberately addressed the bot. If the docs contain
+  the answer, withholding it is just a worse search engine.
+
+Two things do differ, and both are forced by the medium rather than chosen:
+
+| | Channel | DM |
+|---|---|---|
+| G7 deference delay | 45s, dropped if a human answers | **skipped** — no human is going to answer a DM |
+| Abstention | silence | short fixed string (below) |
+| Rate limit | per-channel hourly budget | per-user token bucket, as the ops bot already does |
+
+Ingest redaction matters *more* here, not less. A DM feels private, so people paste whole kubeconfigs
+and token-bearing error dumps into it that they would never put in a channel. The redaction chokepoint
+at ingest (§6) is what stops those from reaching the model context and the audit stream, and the DM
+is the surface it will fire on most.
 
 ---
 
@@ -244,11 +273,17 @@ posting non-answers is worse than a channel with no bot; users learn to scroll p
 answers it *can* give get scrolled past too. Silence costs nothing and is indistinguishable from a
 bot that simply had nothing to add.
 
-**In a DM: say so explicitly.** A DM is unambiguously addressed to the bot, so silence there reads as
-broken. In a DM, abstention returns a short, fixed, non-model-generated string: *"I can only answer
-from the NRP documentation and I couldn't find this there — please ask in #nrp-support."* Fixed
-string, because the interesting failure is a model that explains *why* it can't answer and leaks the
-reasoning.
+**In a DM: say so explicitly.** This is the *non*-answer path only — when the bot has an answer, a DM
+gets it in full, exactly as a channel would (§2). But a DM is unambiguously addressed to the bot, so
+silence there reads as broken rather than as tact. Abstention in a DM returns a short, fixed,
+non-model-generated string: *"I can only answer from the NRP documentation and I couldn't find this
+there — please ask in #nrp-support."*
+
+Fixed string, and identical for every abstention reason. A model-written explanation of *why* it
+cannot answer is an enumeration oracle: "that looks like a question about live cluster state" and "I
+found nothing about that" are different sentences that tell a prober which gate they hit and how to
+rephrase around it. One string for all seven gates leaks nothing, and the real reason is in the audit
+log where it is useful.
 
 **Every abstention is audited with its gate and reason.** New audit event `support_abstain`, with
 `gate` (`triage`/`retrieval`/`entailment`/`citation`/`policy`/`deference`) and the classified
@@ -369,15 +404,27 @@ the "no cluster access" rule, and this is the shape that relieves the pressure w
 Do not point this at users on day one. The confidence threshold cannot be chosen in advance, and the
 cost of finding out in public is that people stop trusting the bot permanently.
 
-**Phase 0 — shadow.** `NRP_OPS_SUPPORT_MODE=shadow`. The bot runs the full pipeline on the real
-support channel and posts nothing there. Every would-be answer goes to a private admin channel,
-with the question, the draft, the citations, the entailment verdict, and the gate that would have
-fired. Admins react 👍/👎. Run until there is a body of judged cases — a few weeks of real traffic,
-not a fixed count — and the false-answer rate on the negative eval set is zero.
+**Phase 0 — shadow, everywhere.** `NRP_OPS_SUPPORT_MODE=shadow`. The bot runs the full pipeline on
+the real support channel and on DMs, and replies to neither. Every would-be answer goes to a private
+admin channel with the question, the draft, the citations, the entailment verdict, and the gate that
+would have fired. Admins react 👍/👎. Run until there is a body of judged cases — a few weeks of real
+traffic, not a fixed count — and the false-answer rate on the negative eval set is zero.
 
-**Phase 1 — ephemeral.** Answers post as `chat.postEphemeral`, visible only to the asker. Wrong
-answers cost one person's time instead of the channel's trust, and the 👎 rate becomes a real number
-from real users rather than admins guessing what a user would think.
+Shadow has to cover DMs too, even though they are the safer surface, because DM questions are a
+*different distribution*. People ask a bot in private what they will not ask a room: the basic
+question they think they should already know, the one with their whole broken YAML pasted in. Those
+are both the questions the docs are most likely to answer and the ones most likely to carry a
+credential, so calibrating only on channel traffic would calibrate on the easier half.
+
+**Phase 1 — DMs go live, channel stays ephemeral.** DMs answer for real. In the channel, answers post
+as `chat.postEphemeral`, visible only to the asker. Both surfaces now cost one person's time on a
+wrong answer instead of the channel's trust, and the 👎 rate becomes a number from real users rather
+than admins guessing what a user would think.
+
+The DM is the better of the two as a pilot, which is the useful consequence of treating it like a
+channel: it is self-selected — someone chose to ask a bot — so the expectation is already calibrated,
+and unlike an ephemeral message it leaves a record the user can scroll back to and dispute. If only
+one surface can go live first, make it this one.
 
 **Phase 2 — in-channel.** Public threaded replies. Keep the shadow channel running as a review feed.
 
@@ -414,6 +461,13 @@ Each gate is also unit-testable without a model: G5 rejects a citation not in th
 rejects an invented URL, the ingest redactor strips a pasted token, the support profile's registry
 contains exactly `{search_docs}`, and the support kustomization renders no ClusterRoleBinding.
 
+One of these is worth stating as an invariant rather than a test case, because it is the sort of thing
+that decays quietly: **the same question in a DM and in a channel produces the same answer text.**
+Scripted model, one question, two events, assert the reply bodies are identical and that only the
+destination and the deference delay differ. Everything about the DM path that *should* differ is in
+delivery, so anything that shows up as a difference in the text is a second answer path that grew by
+accident.
+
 ---
 
 ## 10. Code changes, by file
@@ -425,7 +479,7 @@ contains exactly `{search_docs}`, and the support kustomization renders no Clust
 | `tools/docs.py` | Return a stable `chunk_id` per hit. `section` forced by profile, not model-settable. |
 | `docs_index/sync.py` | `--sections` flag, so the support index is built with `userdocs` only. |
 | `authz.py` | A second decision path. For support the question is not "who is asking" but "is this channel in scope, is this a human, have we answered too much lately" — same audit shape, different gates. |
-| `slack_app.py` | `message.channels` subscription; **inbound redaction at ingest**; the delay-and-defer timer; ephemeral vs. threaded vs. shadow posting. `_post`/`_update` stay the only outbound path. |
+| `slack_app.py` | `message.channels` subscription; **inbound redaction at ingest**; the delay-and-defer timer; ephemeral vs. threaded vs. shadow posting. `message.im` and `message.channels` converge on one handler immediately after G0, so a DM cannot drift into a second answer path. `_post`/`_update` stay the only outbound path. |
 | `prompts.py` | A support system prompt: user-facing tone, grounded-only rule, abstention-is-success. The user's message is wrapped untrusted; there is no trusted-request wrapper in this profile. |
 | `audit.py` | Text suppression for messages that never passed triage; `support_abstain` event. |
 | `support/` (new) | `triage.py`, `draft.py`, `verify.py`, `citations.py` — one module per gate, each independently testable. |
