@@ -336,22 +336,38 @@ class TestCloneFailureIsLegible:
         assert "Could not resolve host" in capsys.readouterr().err.strip().splitlines()[-1]
 
     @pytest.mark.skipif(os.getuid() == 0, reason="root bypasses file permission checks")
-    def test_an_unwritable_index_dir_names_both_sides_of_the_mismatch(self, tmp_path: Path) -> None:
-        """sqlite3 reports this as "unable to open database file", which reads
-        like a missing path. The error has to name the directory's owner *and*
-        the uid trying to write, or there is nothing to act on."""
+    def test_a_mode_only_problem_is_repaired_rather_than_reported(self, tmp_path: Path) -> None:
+        """A directory we own that is merely missing its write bit is ours to
+        fix, and an hourly job should not sit out a cycle over it."""
         locked = tmp_path / "pvc"
         locked.mkdir()
         locked.chmod(0o555)
         try:
-            with pytest.raises(IndexDirectoryUnwritable) as exc:
-                require_writable_index_dir(locked / "docs.sqlite3")
+            require_writable_index_dir(locked / "docs.sqlite3")
+            assert locked.stat().st_mode & 0o200
         finally:
             locked.chmod(0o755)
+
+    def test_an_unrepairable_dir_names_both_sides_of_the_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case the repair cannot reach: a volume owned by another uid.
+        sqlite3 reports it as "unable to open database file", which reads like a
+        missing path, so the error has to name the directory's owner *and* the
+        uid trying to write or there is nothing to act on.
+
+        The probe is stubbed rather than chowning, which needs privileges the
+        suite does not have.
+        """
+        monkeypatch.setattr(
+            sync_module, "_probe_writable", lambda _d: PermissionError(13, "Permission denied")
+        )
+        with pytest.raises(IndexDirectoryUnwritable) as exc:
+            require_writable_index_dir(tmp_path / "docs.sqlite3")
         message = str(exc.value)
-        assert str(locked) in message
-        assert "mode=0555" in message
+        assert str(tmp_path) in message
         assert f"uid={os.getuid()}" in message
+        assert "mode=" in message
         assert "fsGroup" in message
 
     def test_an_uncreatable_index_dir_is_reported(self, tmp_path: Path) -> None:
