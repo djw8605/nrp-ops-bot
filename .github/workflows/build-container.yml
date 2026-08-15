@@ -101,7 +101,19 @@ jobs:
           assert services == {"coder", "jupyterhub", "ceph", "gpu"}, f"playbooks missing: {services}"
 
           tools = registry()
-          assert len(tools) == 9, f"expected 9 tools, got {len(tools)}"
+          # Assert the tools are PRESENT, not that there are exactly N of them.
+          # The count was a tripwire on its own growth: adding get_cronjob made
+          # it 10 and failed two builds, so the image stayed pinned to an old
+          # sha while the fixes those builds carried sat unshipped. What this
+          # step is actually for is catching a tool that fails to register
+          # inside the image -- a missing name catches that, a count does not.
+          expected = {
+              "list_pods", "get_pod_status", "get_logs", "get_events",
+              "get_workload", "get_cronjob", "get_node", "list_nodes",
+              "promql", "search_docs",
+          }
+          missing = expected - set(tools)
+          assert not missing, f"tools missing from the image: {sorted(missing)}"
 
           print(f"ok: {len(services)} playbooks, {len(tools)} tools")
           '

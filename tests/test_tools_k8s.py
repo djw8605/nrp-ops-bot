@@ -366,6 +366,36 @@ class TestGetLogs:
         assert out["line_count"] == 2
         assert out["truncated"] is False
 
+    async def test_an_empty_window_falls_back_to_the_whole_log(self, fake_kube: Any) -> None:
+        """A job that failed in 6 seconds an hour ago has nothing inside the
+        default 30-minute window, and the API returns "" rather than an error --
+        so the traceback that explains the failure reads as "printed nothing"."""
+        calls: list[dict[str, Any]] = []
+
+        async def _log(**kwargs: Any) -> str:
+            calls.append(kwargs)
+            return "" if "since_seconds" in kwargs else "Traceback\nOperationalError\n"
+
+        fake_kube.core.read_namespaced_pod_log = _log
+        out = await get_logs(GetLogsArgs(namespace="coder", pod="docs-sync-abc"))
+
+        assert out["lines"] == ["Traceback", "OperationalError"]
+        assert "whole retained log" in out["note"]
+        assert len(calls) == 2
+        assert "since_seconds" not in calls[1]
+
+    async def test_a_genuinely_empty_log_says_so(self, fake_kube: Any) -> None:
+        fake_kube.core._responses["read_namespaced_pod_log"] = ""
+        out = await get_logs(GetLogsArgs(namespace="coder", pod="coder-0"))
+        assert out["lines"] == []
+        assert "no log output at all" in out["note"]
+
+    async def test_a_window_hit_does_not_refetch(self, fake_kube: Any) -> None:
+        fake_kube.core._responses["read_namespaced_pod_log"] = "line one\n"
+        out = await get_logs(GetLogsArgs(namespace="coder", pod="coder-0"))
+        assert "note" not in out
+        assert len(fake_kube.core.calls) == 1
+
     async def test_tail_lines_above_1000_is_rejected(self, fake_kube: Any) -> None:
         result = await dispatch(
             "get_logs", {"namespace": "coder", "pod": "coder-0", "tail_lines": 5000}

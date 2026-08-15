@@ -22,6 +22,7 @@ vector search on a corpus this full of identifiers, so it is not built yet.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import shutil
@@ -29,6 +30,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +40,11 @@ from nrp_ops_agent.config import get_settings
 
 DOCS_SUBDIR: Final = Path("src/content/docs")
 SCHEMA_VERSION: Final = 1
+
+#: Clone attempts before giving up. The docs mirror being briefly unreachable is
+#: a transient the job can absorb; the schedule is hourly, but a run that fails
+#: leaves the index a full hour staler for no good reason.
+CLONE_ATTEMPTS: Final = 3
 
 _FRONTMATTER: Final = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
 _TITLE_LINE: Final = re.compile(r"^title:\s*(.+?)\s*$", re.MULTILINE)
@@ -288,41 +295,101 @@ def _describe_permissions(directory: Path) -> str:
     return f"{directory} is {owner}; this process runs as {running}"
 
 
+def _probe_writable(directory: Path) -> OSError | None:
+    """Actually try to create a file. Returns the error, or None on success.
+
+    ``os.access(W_OK)`` is not used: it answers from the mode bits alone and
+    lies under exactly the conditions that matter here -- root squash, a
+    read-only mount, and ACLs that disagree with the mode.
+    """
+    probe = directory / f".docs-sync-write-probe.{os.getpid()}"
+    try:
+        probe.touch()
+    except OSError as exc:
+        return exc
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
+    return None
+
+
 def require_writable_index_dir(db_path: Path) -> None:
-    """Fail early and legibly if the index cannot be written.
+    """Make the index directory usable, or explain precisely why it is not.
 
     Called before the clone rather than after it: a permissions problem is not
     worth a 30-second checkout to discover, and the previous ordering buried the
     real fault under a traceback from deep inside build_index.
+
+    Everything here is best-effort repair before giving up, because the common
+    failure is a volume whose root was created by someone else and only needs a
+    directory or a mode bit to become usable.
     """
     directory = db_path.parent
+
+    # Create the whole tree, not just the leaf: a subPath mount or a fresh
+    # volume can present an empty root with nothing underneath it.
     try:
         directory.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as exc:
+        raise IndexDirectoryUnwritable(
+            f"{directory} exists but is not a directory ({exc}); the mount path is wrong"
+        ) from exc
     except OSError as exc:
         raise IndexDirectoryUnwritable(
             f"cannot create the index directory: {_describe_permissions(directory)} ({exc})"
         ) from exc
 
-    probe = directory / ".docs-sync-write-probe"
-    try:
-        probe.touch()
-        probe.unlink()
-    except OSError as exc:
-        raise IndexDirectoryUnwritable(
-            f"cannot write the docs index: {_describe_permissions(directory)} ({exc}). "
-            "The PVC is mounted but not writable by this user. Either the CephFS CSI driver "
-            "is not applying fsGroup (fsGroupPolicy must be File, not None), or the volume "
-            "root is owned by another uid. Confirm with: kubectl -n system-nrp-ops-bot exec "
-            "deploy/nrp-ops-agent -- ls -lnd /var/lib/nrp-ops-agent"
-        ) from exc
+    failure = _probe_writable(directory)
+    if failure is None:
+        return
+
+    # Repair attempt: if this process owns the directory, or shares its group,
+    # the mode alone may be the problem and is ours to widen. A volume chowned
+    # to another uid entirely is not, and falls through to the error below.
+    with contextlib.suppress(OSError):
+        mode = directory.stat().st_mode & 0o7777
+        directory.chmod(mode | 0o770)
+        if _probe_writable(directory) is None:
+            print(
+                f"index directory was not writable; relaxed its mode to "
+                f"{directory.stat().st_mode & 0o7777:04o}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+    raise IndexDirectoryUnwritable(
+        f"cannot write the docs index: {_describe_permissions(directory)} ({failure}). "
+        "The PVC is mounted but not writable by this user, and relaxing the mode did not "
+        "help, so the volume belongs to another uid. Either the CephFS CSI driver is not "
+        "applying fsGroup (fsGroupPolicy must be File, not None), or the volume root was "
+        "created by a different user. Confirm with: kubectl -n system-nrp-ops-bot exec "
+        "deploy/nrp-ops-agent -- ls -lnd /var/lib/nrp-ops-agent"
+    )
 
 
 def build_index(chunks: list[Chunk], db_path: Path) -> int:
     require_writable_index_dir(db_path)
-    tmp_path = db_path.with_suffix(db_path.suffix + ".building")
-    tmp_path.unlink(missing_ok=True)
 
-    conn = sqlite3.connect(tmp_path)
+    # A unique name per run. The fixed ".building" path was fine until a run
+    # died holding it: a leftover owned by another uid cannot be unlinked, and
+    # every subsequent run then failed on a file that had nothing to do with it.
+    # Same directory, so the replace below is still atomic.
+    tmp_path = db_path.with_suffix(f"{db_path.suffix}.building.{os.getpid()}")
+    with contextlib.suppress(OSError):
+        db_path.with_suffix(db_path.suffix + ".building").unlink(missing_ok=True)
+
+    try:
+        conn = sqlite3.connect(tmp_path)
+    except sqlite3.OperationalError as exc:
+        # SQLite says "unable to open database file" for a missing directory, a
+        # missing file and a denial alike. The preflight above should have
+        # caught this; if it did not, do not let the vaguest of the three
+        # possible meanings be the whole error.
+        raise IndexDirectoryUnwritable(
+            f"could not create {tmp_path}: {exc}. {_describe_permissions(db_path.parent)}"
+        ) from exc
+
     try:
         conn.executescript(_DDL)
         conn.executemany(
@@ -339,12 +406,33 @@ def build_index(chunks: list[Chunk], db_path: Path) -> int:
             [("schema_version", str(SCHEMA_VERSION)), ("chunk_count", str(len(chunks)))],
         )
         conn.commit()
-    finally:
+    except BaseException:
+        # Never leave a partial build behind for the next run to trip over.
         conn.close()
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        raise
+    else:
+        conn.close()
+
+    # The agent reads this file as a different pod and possibly a different uid
+    # (fsGroup only guarantees the group). SQLite creates it 0600 under the
+    # default umask, which would leave the reader with an index it can see and
+    # cannot open.
+    with contextlib.suppress(OSError):
+        tmp_path.chmod(0o664)
 
     # Atomic swap: readers either see the old index or the new one, never a
     # half-built one. The CronJob and the agent share this file on a PVC.
-    tmp_path.replace(db_path)
+    try:
+        tmp_path.replace(db_path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        raise IndexDirectoryUnwritable(
+            f"built the index but could not move it into place at {db_path}: {exc}. "
+            f"{_describe_permissions(db_path.parent)}"
+        ) from exc
     return len(chunks)
 
 
@@ -366,24 +454,43 @@ def clone_docs(repo_url: str, dest: Path, ref: str | None = None) -> Path:
         cmd += ["--branch", ref]
     cmd += [repo_url, str(dest)]
 
-    print(f"cloning {repo_url}" + (f" at {ref}" if ref else ""), file=sys.stderr, flush=True)
-    try:
-        proc = subprocess.run(  # noqa: S603
-            cmd, check=False, capture_output=True, timeout=600, text=True
+    last = ""
+    for attempt in range(1, CLONE_ATTEMPTS + 1):
+        print(
+            f"cloning {repo_url}" + (f" at {ref}" if ref else "") + f" (attempt {attempt})",
+            file=sys.stderr,
+            flush=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        # A drop rather than a refusal: almost always egress policy. A refusal
-        # would have come back as a fast non-zero exit instead.
-        raise CloneFailed(
-            f"git clone of {repo_url} timed out after 600s with no response. This is what a "
-            "blocked egress path looks like -- check the NetworkPolicy allows HTTPS to the "
-            "docs host, and that the host resolves."
-        ) from exc
+        # git refuses a non-empty destination, so a retry has to start clean.
+        with contextlib.suppress(OSError):
+            shutil.rmtree(dest, ignore_errors=True)
+        try:
+            proc = subprocess.run(  # noqa: S603
+                cmd, check=False, capture_output=True, timeout=600, text=True
+            )
+        except subprocess.TimeoutExpired:
+            # A drop rather than a refusal: almost always egress policy. A
+            # refusal would have come back as a fast non-zero exit instead.
+            last = (
+                "timed out after 600s with no response. This is what a blocked egress path "
+                "looks like -- check the NetworkPolicy allows HTTPS to the docs host, and "
+                "that the host resolves."
+            )
+        else:
+            if proc.returncode == 0:
+                return dest
+            last = f"exit {proc.returncode}:\n" + (
+                (proc.stderr or proc.stdout or "").strip() or "(git wrote nothing to stderr)"
+            )
 
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip() or "(git wrote nothing to stderr)"
-        raise CloneFailed(f"git clone of {repo_url} failed with exit {proc.returncode}:\n{detail}")
-    return dest
+        # A docs mirror that is briefly unreachable should cost a retry, not a
+        # failed run and an index an hour staler than it needs to be.
+        if attempt < CLONE_ATTEMPTS:
+            delay = 2**attempt
+            print(f"clone failed, retrying in {delay}s: {last}", file=sys.stderr, flush=True)
+            time.sleep(delay)
+
+    raise CloneFailed(f"git clone of {repo_url} failed after {CLONE_ATTEMPTS} attempts -- {last}")
 
 
 def sync(

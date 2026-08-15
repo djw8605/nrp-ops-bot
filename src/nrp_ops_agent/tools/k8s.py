@@ -494,27 +494,46 @@ class GetLogsArgs(_Args):
 async def get_logs(args: GetLogsArgs) -> dict[str, Any]:
     _require_namespace(args.namespace)
     clients = await _clients()
+
+    async def _read(since: int | None) -> str:
+        kwargs: dict[str, Any] = {
+            "name": args.pod,
+            "namespace": args.namespace,
+            "container": args.container,
+            "tail_lines": args.tail_lines,
+            "previous": args.previous,
+            "timestamps": True,
+        }
+        if since is not None:
+            kwargs["since_seconds"] = since
+        raw = await clients.core.read_namespaced_pod_log(**kwargs)
+        return raw if isinstance(raw, str) else str(raw or "")
+
     try:
-        raw = await clients.core.read_namespaced_pod_log(
-            name=args.pod,
-            namespace=args.namespace,
-            container=args.container,
-            tail_lines=args.tail_lines,
-            since_seconds=args.since_seconds,
-            previous=args.previous,
-            timestamps=True,
-        )
+        text = await _read(args.since_seconds)
     except Exception as exc:
         raise _wrap_api_error(exc) from exc
 
-    text = raw if isinstance(raw, str) else str(raw or "")
+    # A short-lived pod that failed an hour ago has every line outside the
+    # default 30-minute window, and the API answers that with an empty string
+    # rather than an error -- which reads as "the container printed nothing"
+    # and is how a crashed job's traceback goes missing. An empty window is
+    # never the useful answer, so widen it once and say that we did.
+    widened = False
+    if not text.strip():
+        try:
+            retry = await _read(None)
+        except Exception:
+            retry = ""
+        if retry.strip():
+            text, widened = retry, True
     truncated = False
     if len(text.encode("utf-8")) > MAX_LOG_BYTES:
         text = text.encode("utf-8")[-MAX_LOG_BYTES:].decode("utf-8", errors="ignore")
         truncated = True
 
     lines = text.splitlines()
-    return {
+    result: dict[str, Any] = {
         "namespace": args.namespace,
         "pod": args.pod,
         "container": args.container,
@@ -523,6 +542,17 @@ async def get_logs(args: GetLogsArgs) -> dict[str, Any]:
         "truncated": truncated,
         "lines": lines,
     }
+    if widened:
+        result["note"] = (
+            f"Nothing was written in the last {args.since_seconds}s, so the whole retained "
+            "log is shown instead. The container is older than the requested window."
+        )
+    elif not lines:
+        result["note"] = (
+            "The container produced no log output at all. It may have been killed before "
+            "writing, or its output may already have been rotated away."
+        )
+    return result
 
 
 # --------------------------------------------------------------------------- #

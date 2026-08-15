@@ -291,6 +291,7 @@ class TestCloneFailureIsLegible:
             )
 
         monkeypatch.setattr(sync_module.subprocess, "run", fake_run)
+        monkeypatch.setattr(sync_module, "CLONE_ATTEMPTS", 1)
         with pytest.raises(CloneFailed, match="Could not resolve host"):
             clone_docs("https://gitlab.nrp-nautilus.io/prp/nrp-site.git", tmp_path / "co")
 
@@ -301,8 +302,28 @@ class TestCloneFailureIsLegible:
             raise subprocess.TimeoutExpired(cmd, 600)
 
         monkeypatch.setattr(sync_module.subprocess, "run", fake_run)
+        monkeypatch.setattr(sync_module, "CLONE_ATTEMPTS", 1)
         with pytest.raises(CloneFailed, match="egress"):
             clone_docs("https://gitlab.nrp-nautilus.io/prp/nrp-site.git", tmp_path / "co")
+
+    def test_a_transient_clone_failure_is_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The docs mirror blinking should cost a retry, not an hour of staleness."""
+        attempts = 0
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return ns(returncode=128, stdout="", stderr="fatal: could not read from remote")
+            return ns(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(sync_module.subprocess, "run", fake_run)
+        monkeypatch.setattr(sync_module.time, "sleep", lambda _s: None)
+        out = clone_docs("https://gitlab.nrp-nautilus.io/prp/nrp-site.git", tmp_path / "co")
+        assert attempts == 2
+        assert out == tmp_path / "co"
 
     def test_main_exits_nonzero_with_the_reason_on_the_last_line(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -356,6 +377,36 @@ class TestCloneFailureIsLegible:
         blocker.write_text("x", encoding="utf-8")
         with pytest.raises(IndexDirectoryUnwritable):
             sync(db_path=blocker / "sub" / "docs.sqlite3", site_base_url=SITE)
+
+    def test_a_stale_building_file_does_not_block_the_next_run(
+        self, tmp_path: Path, docs_checkout: Path
+    ) -> None:
+        """A run that died mid-build used to leave a fixed .building path behind.
+        Owned by another uid it cannot be unlinked, and every later run failed on
+        a file that had nothing to do with it."""
+        db = tmp_path / "docs.sqlite3"
+        stale = db.with_suffix(db.suffix + ".building")
+        stale.write_text("garbage from a killed run", encoding="utf-8")
+
+        assert sync(db_path=db, site_base_url=SITE, local_checkout=docs_checkout) > 0
+        assert db.exists()
+        assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == ["docs.sqlite3"]
+
+    def test_a_failed_build_leaves_no_artefact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db = tmp_path / "docs.sqlite3"
+        monkeypatch.setattr(sync_module, "_DDL", "THIS IS NOT SQL")
+        with pytest.raises(sqlite3.Error):
+            build_index([], db)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_the_index_is_group_readable(self, tmp_path: Path, docs_checkout: Path) -> None:
+        """The agent reads this file from a different pod; fsGroup guarantees the
+        group, not the uid, and SQLite would otherwise create it 0600."""
+        db = tmp_path / "docs.sqlite3"
+        sync(db_path=db, site_base_url=SITE, local_checkout=docs_checkout)
+        assert db.stat().st_mode & 0o060 == 0o040 or db.stat().st_mode & 0o060 == 0o060
 
     def test_a_writable_dir_passes(self, tmp_path: Path) -> None:
         require_writable_index_dir(tmp_path / "docs.sqlite3")
