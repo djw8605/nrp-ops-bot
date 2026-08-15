@@ -30,7 +30,7 @@ RUN pip install .
 FROM python:3.12-slim
 
 # git is a runtime dependency, not a build one: nrp-ops-docs-sync clones the
-# docs repository on every CronJob run. ca-certificates is needed for the HTTPS
+# docs repository on every rebuild. ca-certificates is needed for the HTTPS
 # clone and for the Prometheus/LLM calls.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
@@ -38,10 +38,10 @@ RUN apt-get update \
 
 COPY --from=builder /opt/venv /opt/venv
 
-# HOME=/tmp because both workloads mount an emptyDir at /tmp and it is the only
+# HOME=/tmp because both containers mount an emptyDir at /tmp and it is the only
 # writable path under readOnlyRootFilesystem. git resolves HOME even for an
-# anonymous clone, so pointing it there keeps the docs-sync job from failing on
-# a read-only filesystem.
+# anonymous clone, so pointing it there keeps the docs-sync sidecar from failing
+# on a read-only filesystem.
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -51,7 +51,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # so the image is correct on its own, rather than only under that one manifest.
 USER 65532:65532
 
-# No ENTRYPOINT on purpose: both workloads select their console script through
+# No ENTRYPOINT on purpose: both containers select their console script through
 # `args` (nrp-ops-agent, nrp-ops-docs-sync), which Kubernetes maps to the
 # container command. Setting an ENTRYPOINT here would silently turn those into
 # arguments to it.

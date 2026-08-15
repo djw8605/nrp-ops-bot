@@ -1,6 +1,15 @@
 """Clone the NRP docs site, chunk its MDX, and build a SQLite FTS5 index.
 
-Run hourly by ``deploy/cronjob-docs-sync.yaml`` into a PVC.
+Runs as the ``docs-sync`` sidecar in ``deploy/deployment.yaml``: one long-lived
+container calling :func:`sync_forever`, writing into an ``emptyDir`` shared with
+the agent container beside it. It used to be a CronJob writing to an RWX CephFS
+PVC, which spent more time broken than working -- the volume root was created
+root-owned and the CSI driver never applied ``fsGroup``, so every run died on
+"Permission denied" and the index was never built at all. An ``emptyDir`` gets
+the pod's ``fsGroup`` unconditionally, with no CSI driver in the path.
+
+The cost of that trade is that the index is rebuilt on every pod start rather
+than surviving one, which for ~870 chunks is about a minute of one CPU.
 
 Design notes:
 
@@ -34,7 +43,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from nrp_ops_agent.config import get_settings
 
@@ -45,6 +54,15 @@ SCHEMA_VERSION: Final = 1
 #: a transient the job can absorb; the schedule is hourly, but a run that fails
 #: leaves the index a full hour staler for no good reason.
 CLONE_ATTEMPTS: Final = 3
+
+#: Seconds between rebuilds when running under ``--every`` with no value given.
+REBUILD_INTERVAL: Final = 3600
+
+#: How long to wait after a *failed* rebuild, rather than the full interval. The
+#: run that matters most is the first one of a pod's life -- until it lands
+#: ``search_docs`` has nothing to answer from -- and sitting out an hour over a
+#: docs mirror that blinked is the wrong trade.
+RETRY_AFTER_FAILURE: Final = 300
 
 _FRONTMATTER: Final = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
 _TITLE_LINE: Final = re.compile(r"^title:\s*(.+?)\s*$", re.MULTILINE)
@@ -360,11 +378,14 @@ def require_writable_index_dir(db_path: Path) -> None:
 
     raise IndexDirectoryUnwritable(
         f"cannot write the docs index: {_describe_permissions(directory)} ({failure}). "
-        "The PVC is mounted but not writable by this user, and relaxing the mode did not "
-        "help, so the volume belongs to another uid. Either the CephFS CSI driver is not "
-        "applying fsGroup (fsGroupPolicy must be File, not None), or the volume root was "
-        "created by a different user. Confirm with: kubectl -n system-nrp-ops-bot exec "
-        "deploy/nrp-ops-agent -- ls -lnd /var/lib/nrp-ops-agent"
+        "The directory is mounted but not writable by this user, and relaxing the mode did "
+        "not help, so it belongs to another uid. In the cluster this path is an emptyDir "
+        "inside the agent pod and should always be writable, so suspect either a "
+        "securityContext whose fsGroup no longer matches runAsUser, or a "
+        "NRP_OPS_DOCS_DB_PATH pointing at something else -- a PVC root is root-owned "
+        "unless its CSI driver applies fsGroup, which is the failure that moved this "
+        "index off a PVC in the first place. Confirm with: kubectl -n system-nrp-ops-bot "
+        "exec deploy/nrp-ops-agent -c docs-sync -- ls -lnd /var/lib/nrp-ops-agent"
     )
 
 
@@ -415,10 +436,10 @@ def build_index(chunks: list[Chunk], db_path: Path) -> int:
     else:
         conn.close()
 
-    # The agent reads this file as a different pod and possibly a different uid
-    # (fsGroup only guarantees the group). SQLite creates it 0600 under the
-    # default umask, which would leave the reader with an index it can see and
-    # cannot open.
+    # The agent reads this file from the container next door. That is the same
+    # uid today, but the two containers are only guaranteed to share the pod's
+    # fsGroup, and SQLite creates the file 0600 under the default umask -- which
+    # would leave the reader with an index it can see and cannot open.
     with contextlib.suppress(OSError):
         tmp_path.chmod(0o664)
 
@@ -537,6 +558,45 @@ def sync(
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def sync_forever(every: float, **kwargs: Any) -> None:
+    """Rebuild the index every ``every`` seconds, forever. Never returns.
+
+    This is how docs-sync runs in production now that it is a sidecar rather
+    than a CronJob: there is no controller left to re-run it on a schedule, so
+    the schedule lives here.
+
+    Nothing in this loop is allowed to be fatal. A CronJob run that failed was
+    retried by the Job controller and, at worst, showed up as a failed Job; a
+    sidecar that exits takes its restart budget with it and eventually
+    CrashLoopBackOffs next to a perfectly healthy agent. A failed rebuild
+    therefore logs and waits, and the previous index -- if there is one --
+    stays in place and keeps answering.
+    """
+    while True:
+        started = time.monotonic()
+        try:
+            count = sync(**kwargs)
+        # Broad on purpose -- see the docstring: nothing here may be fatal.
+        except Exception as exc:
+            delay = min(every, RETRY_AFTER_FAILURE)
+            print(
+                f"docs-sync failed: {type(exc).__name__}: {exc}; retrying in {delay:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            # Measure from the start of the run, so a rebuild that takes two
+            # minutes does not push the next one to interval + 2 minutes and
+            # walk the rebuild time around the clock.
+            delay = max(0.0, every - (time.monotonic() - started))
+            print(
+                f"indexed {count} chunks; next rebuild in {delay:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+        time.sleep(delay)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build the NRP docs FTS5 index.")
     parser.add_argument("--repo-url", default=None)
@@ -548,7 +608,34 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Index an existing nrp-site checkout instead of cloning.",
     )
+    parser.add_argument(
+        "--every",
+        nargs="?",
+        type=float,
+        const=float(REBUILD_INTERVAL),
+        default=None,
+        metavar="SECONDS",
+        help=(
+            f"Rebuild on a loop instead of once, every SECONDS "
+            f"(default {REBUILD_INTERVAL}). How the sidecar runs; a bare "
+            f"invocation still builds once and exits, which is what the "
+            f"development path and the seed command want."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.every is not None:
+        if args.every <= 0:
+            parser.error("--every must be greater than zero")
+        # Does not return, and does not fail: sync_forever swallows the
+        # per-rebuild failures a long-lived container must survive.
+        sync_forever(
+            args.every,
+            repo_url=args.repo_url,
+            db_path=args.db_path,
+            site_base_url=args.site_base_url,
+            local_checkout=args.local_checkout,
+        )
 
     try:
         count = sync(

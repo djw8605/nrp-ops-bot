@@ -28,8 +28,14 @@ resources:
   - clusterrole.yaml
   - clusterrolebinding.yaml
   - configmap-allowlist.yaml
+  # Carries both containers: the agent and the docs-sync sidecar. There is no
+  # cronjob-docs-sync.yaml any more -- the index moved off the CephFS PVC and
+  # into an emptyDir in the agent pod, which the CronJob could not have shared.
+  #
+  #   ArgoCD prunes what this list drops, so the old CronJob and the
+  #   `nrp-ops-agent-docs` PVC are deleted on the sync that carries this. That
+  #   is intended: the PVC held nothing, having never been writable.
   - deployment.yaml
-  - cronjob-docs-sync.yaml
   - networkpolicy.yaml
   # Encrypted to this cluster's sealed-secrets key, so it is safe in a public
   # repo: only the controller in this cluster can decrypt it. Sealed with the

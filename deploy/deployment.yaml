@@ -1,4 +1,21 @@
 ---
+# The agent and the docs indexer run as two containers in one pod, sharing the
+# index over an emptyDir.
+#
+# This used to be a Deployment plus a CronJob plus an RWX CephFS PVC, and that
+# arrangement never once produced an index: the CSI driver did not apply the
+# pod's fsGroup, so the volume root stayed root:root 0755 and every run of the
+# job died writing to it. Nothing running as 65532 can chown that, and under the
+# restricted Pod Security this namespace is meant to carry no initContainer can
+# run as root to do it either -- the fix was cluster-side, on the CSI driver or
+# the volume, and out of this repo's hands.
+#
+# An emptyDir has no such failure mode: the kubelet creates it per pod and
+# applies fsGroup unconditionally, with no CSI driver in the path. What it costs
+# is persistence -- the index is rebuilt when the pod restarts, roughly a minute
+# of one CPU for ~870 chunks -- and that is the whole of the trade. Nothing else
+# wanted the PVC: one replica, Recreate strategy, and a corpus that is a git
+# clone away.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -83,6 +100,9 @@ spec:
             - name: allowlist
               mountPath: /etc/nrp-ops-agent
               readOnly: true
+            # Read-only even though the sidecar next door writes it: the agent
+            # has no business editing its own index, and the mount is the only
+            # thing enforcing that now that they share a pod.
             - name: docs
               mountPath: /var/lib/nrp-ops-agent
               readOnly: true
@@ -102,36 +122,78 @@ spec:
               command: ["python", "-c", "import nrp_ops_agent"]
             initialDelaySeconds: 15
             periodSeconds: 60
+
+        # Rebuilds the docs index in place, hourly, for as long as the pod
+        # lives. `--every` is what makes this a sidecar rather than a job: there
+        # is no controller left to re-run it, so the schedule is inside the
+        # process. It never exits on a failed rebuild -- a docs mirror outage
+        # must not CrashLoopBackOff a container sitting next to a healthy agent
+        # -- so a red docs index shows up in this container's log and in
+        # search_docs, not in the pod's restart count.
+        #
+        # An ordinary container rather than a native sidecar (an initContainer
+        # with restartPolicy: Always) on purpose: on a cluster older than 1.29
+        # that field is pruned, which would turn this into an init container
+        # that loops forever and a pod that never starts. The ordering it would
+        # buy is not needed -- the agent tolerates a missing index and says so.
+        #
+        # One thing the CronJob had that this does not: the job set
+        # automountServiceAccountToken: false, and a container in this pod gets
+        # the agent's token whether it wants it or not. The indexer talks to
+        # GitLab and a file, never to the API server, so it never reads it --
+        # but a pod-level setting cannot be scoped to one container, and taking
+        # the token away here would break the agent beside it.
+        - name: docs-sync
+          # Placeholder, like the agent's above: deploy/kustomization.yaml
+          # rewrites both, so one image bump still moves the pair.
+          image: ghcr.io/nrp/nrp-ops-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["nrp-ops-docs-sync", "--every", "3600"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: NRP_OPS_DOCS_REPO_URL
+              value: https://gitlab.nrp-nautilus.io/prp/nrp-site.git
+            # Same path the agent reads, on the shared emptyDir below.
+            - name: NRP_OPS_DOCS_DB_PATH
+              value: /var/lib/nrp-ops-agent/docs.sqlite3
+            - name: NRP_OPS_DOCS_SITE_BASE_URL
+              value: https://nrp.ai
+            - name: NRP_OPS_AUDIT_STREAM
+              value: stdout
+            # git clone needs somewhere to write under a read-only rootfs.
+            - name: TMPDIR
+              value: /tmp
+          volumeMounts:
+            - name: docs
+              mountPath: /var/lib/nrp-ops-agent
+            # Its own /tmp, not the agent's: the checkout is far larger than
+            # anything the agent writes, and a shared 64Mi would fail the clone.
+            - name: sync-tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
       volumes:
         - name: allowlist
           configMap:
             name: nrp-ops-agent-allowlist
+        # Written by docs-sync, read by the agent. Both containers get the pod's
+        # fsGroup here, which is exactly what the CephFS PVC never delivered.
         - name: docs
-          persistentVolumeClaim:
-            claimName: nrp-ops-agent-docs
-            readOnly: true
+          emptyDir:
+            sizeLimit: 512Mi
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: nrp-ops-agent-docs
-  namespace: system-nrp-ops-bot
-  labels:
-    app.kubernetes.io/name: nrp-ops-agent
-spec:
-  accessModes: ["ReadWriteMany"]  # the CronJob writes while the agent reads
-  resources:
-    requests:
-      storage: 1Gi
-  # One class per Ceph cluster. This pins the docs index to the *central*
-  # cluster (provisioner rook-system.cephfs.csi.ceph.com), rather than the
-  # `cephfs` class, which is a different cluster
-  # (rook-ceph.cephfs.csi.ceph.com) and left this PVC Pending.
-  #
-  #   NOTE: storageClassName is immutable on an existing PVC. Changing it here
-  #   does not migrate a live claim -- the claim must be deleted and recreated,
-  #   or the sync fails with a field-immutable error.
-  storageClassName: rook-cephfs-central
+        - name: sync-tmp
+          emptyDir:
+            sizeLimit: 2Gi

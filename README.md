@@ -129,11 +129,16 @@ crawl the rendered HTML, which loses heading structure and reflows code blocks.
   indexed, and the admin guide is the one that holds the actual runbooks
 - Built atomically into `<db>.building` and renamed on success, so the agent never reads a
   half-built index. A checkout yielding zero chunks is a failure, not an empty index
-- Rebuilt hourly at `:17` by `deploy/cronjob-docs-sync.yaml`, so the worst case is a runbook edit
-  the bot cites in its pre-edit form for under an hour. A run is a shallow clone and a full rebuild
-  — about a minute — so the schedule is bounded by politeness to the docs repo, not by cost.
-  **Currently on a temporary 10-minute schedule** while the PVC permission failure is diagnosed;
-  the values to restore are listed on `schedule` in that file
+- Rebuilt hourly by the `docs-sync` sidecar in `deploy/deployment.yaml` (`nrp-ops-docs-sync
+  --every 3600`), so the worst case is a runbook edit the bot cites in its pre-edit form for under
+  an hour. A rebuild is a shallow clone and a full rebuild — about a minute — so the interval is
+  bounded by politeness to the docs repo, not by cost
+- The index lives on an `emptyDir` shared by the two containers in the pod, so it is rebuilt on
+  every pod start and does not survive one. That is deliberate: it was a CronJob writing to an RWX
+  CephFS PVC until 2026-08-15, and it never produced an index once — the CSI driver did not apply
+  the pod's `fsGroup`, the volume root stayed `root:root 0755`, and nothing running as uid 65532
+  could fix that from inside the cluster. A minute of rebuild on restart buys the whole failure
+  mode away
 
 `Retriever` is the seam for embeddings later. Phase 1 is BM25 only — exact-term matching beats pure
 vector search on a corpus this full of identifiers. Retrieval quality is pinned by ten operator-style
@@ -191,7 +196,7 @@ endpoint, credential, namespace or Slack ID is hardcoded anywhere else in the pa
 | `NRP_OPS_AGENT_MAX_ITERATIONS` | `8` | loop iterations |
 | `NRP_OPS_AGENT_WALL_CLOCK_TIMEOUT_S` | `120` | |
 | `NRP_OPS_AGENT_TOOL_OUTPUT_TOKEN_BUDGET` | `60000` | oldest results dropped past this |
-| `NRP_OPS_DOCS_DB_PATH` | `/var/lib/nrp-ops-agent/docs.sqlite3` | on a PVC |
+| `NRP_OPS_DOCS_DB_PATH` | `/var/lib/nrp-ops-agent/docs.sqlite3` | emptyDir shared with the sidecar |
 | `NRP_OPS_DOCS_REPO_URL` | `https://gitlab.nrp-nautilus.io/prp/nrp-site.git` | |
 | `NRP_OPS_AUDIT_STREAM` | `stdout` | |
 
@@ -387,7 +392,11 @@ the corrections are in the source. What that pass found, and what is still open:
    The old query returned an empty result rather than an error — indistinguishable from "no errors".
 6. **The docs PVC storage class `rook-cephfs` does not exist.** The RWX CephFS class on this
    cluster is called `cephfs`. The PVC would have stayed Pending forever, leaving the agent
-   with no docs index.
+   with no docs index. Two rounds of chasing that claim later — `cephfs` was the wrong Ceph
+   cluster, then `rook-cephfs-central` bound but was unwritable, its root `root:root 0755`
+   because the CSI driver never applied `fsGroup` — **the PVC is gone entirely**. The index is
+   an `emptyDir` rebuilt by a sidecar. Persisting a file that a one-minute `git clone`
+   reconstructs was never worth a storage dependency this cluster could not satisfy.
 7. **`ceph_pool_percent_used` is a fraction in 0..1, not a percent.** The fullest pool reads `0.84`,
    meaning **84% full**. Reported verbatim it sounds like 0.84% — reassuring, and exactly backwards,
    on the one metric that explains hanging writes.
@@ -632,10 +641,11 @@ kubectl -n system-nrp-ops-bot rollout restart deployment/nrp-ops-agent
    ```bash
    kubectl apply -f argocd/application.yaml
    ```
-6. **Seed the docs index.** The PVC starts empty and the CronJob is on a schedule, so `search_docs`
-   returns nothing until it has run once:
+6. **Nothing to seed.** The `docs-sync` sidecar builds the index as soon as the pod starts and
+   hourly after that. `search_docs` returns `docs_index_missing` for the first minute or so; if it
+   still does, the sidecar is failing and its log says why:
    ```bash
-   kubectl -n system-nrp-ops-bot create job --from=cronjob/nrp-ops-agent-docs-sync docs-sync-initial
+   kubectl -n system-nrp-ops-bot logs deploy/nrp-ops-agent -c docs-sync
    ```
 
 Render what ArgoCD will apply, without a cluster:
@@ -650,8 +660,8 @@ To apply by hand instead of through ArgoCD:
 kubectl apply -k deploy/
 ```
 
-The docs index starts empty, so run that CronJob once before expecting `search_docs` to return
-anything.
+The docs index starts empty and the `docs-sync` sidecar fills it about a minute after the pod
+starts, so `search_docs` answers nothing until then.
 
 Confirm the RBAC does what it claims, against the real cluster:
 

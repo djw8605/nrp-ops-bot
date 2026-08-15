@@ -31,6 +31,7 @@ from nrp_ops_agent.docs_index.sync import (
     split_frontmatter,
     strip_mdx,
     sync,
+    sync_forever,
     url_for,
 )
 from nrp_ops_agent.tools import dispatch
@@ -434,6 +435,151 @@ class TestCloneFailureIsLegible:
         (checkout / "website").mkdir(parents=True)
         with pytest.raises(FileNotFoundError, match="website"):
             sync(db_path=tmp_path / "x.sqlite3", local_checkout=checkout)
+
+
+class TestTheSidecarLoop:
+    """`--every` is what replaced the CronJob when the index moved off the PVC.
+
+    The Job controller used to own both the schedule and the retry; a sidecar
+    has neither. So the loop has to survive what a Job was allowed to die from
+    -- an unreachable docs mirror must not turn into a CrashLoopBackOff beside
+    a perfectly healthy agent.
+    """
+
+    class _Stop(RuntimeError):
+        """Breaks out of the infinite loop from a stubbed sleep."""
+
+    def _record_sleeps(self, monkeypatch: pytest.MonkeyPatch, *, stop_after: int) -> list[float]:
+        recorded: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            recorded.append(seconds)
+            if len(recorded) >= stop_after:
+                raise self._Stop
+
+        monkeypatch.setattr(sync_module.time, "sleep", fake_sleep)
+        return recorded
+
+    def test_a_failed_rebuild_waits_and_tries_again(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        attempts = 0
+
+        def flaky(**kwargs: Any) -> int:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise CloneFailed("Could not resolve host gitlab.nrp-nautilus.io")
+            return 870
+
+        monkeypatch.setattr(sync_module, "sync", flaky)
+        sleeps = self._record_sleeps(monkeypatch, stop_after=2)
+
+        with pytest.raises(self._Stop):
+            sync_forever(3600)
+
+        assert attempts == 2
+        # Sooner than the full interval: until the first build lands there is
+        # no index at all, and an hour of that over a blip is the wrong trade.
+        assert sleeps[0] == sync_module.RETRY_AFTER_FAILURE
+        assert "Could not resolve host" in capsys.readouterr().err
+
+    def test_the_retry_never_outlasts_the_interval(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A short interval must not be lengthened by the failure path."""
+
+        def boom(**kwargs: Any) -> int:
+            raise CloneFailed("nope")
+
+        monkeypatch.setattr(sync_module, "sync", boom)
+        sleeps = self._record_sleeps(monkeypatch, stop_after=1)
+        with pytest.raises(self._Stop):
+            sync_forever(30)
+        assert sleeps == [30]
+
+    def test_the_wait_is_measured_from_the_start_of_the_rebuild(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise a two-minute rebuild makes the period interval + two
+        minutes, and the rebuild time walks around the clock."""
+        ticks = iter([0.0, 120.0])
+        monkeypatch.setattr(sync_module.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(sync_module, "sync", lambda **kwargs: 870)
+        sleeps = self._record_sleeps(monkeypatch, stop_after=1)
+        with pytest.raises(self._Stop):
+            sync_forever(3600)
+        assert sleeps == [3480.0]
+
+    def test_a_rebuild_slower_than_the_interval_does_not_sleep_negative(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ticks = iter([0.0, 5000.0])
+        monkeypatch.setattr(sync_module.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(sync_module, "sync", lambda **kwargs: 870)
+        sleeps = self._record_sleeps(monkeypatch, stop_after=1)
+        with pytest.raises(self._Stop):
+            sync_forever(3600)
+        assert sleeps == [0.0]
+
+    def test_every_selects_the_loop_and_carries_the_other_arguments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: dict[str, Any] = {}
+
+        def fake_forever(every: float, **kwargs: Any) -> None:
+            seen.update(kwargs, every=every)
+            raise self._Stop
+
+        monkeypatch.setattr(sync_module, "sync_forever", fake_forever)
+        with pytest.raises(self._Stop):
+            sync_module.main(["--every", "60", "--db-path", "/var/lib/x/docs.sqlite3"])
+        assert seen["every"] == 60.0
+        assert seen["db_path"] == Path("/var/lib/x/docs.sqlite3")
+
+    def test_a_bare_every_uses_the_default_interval(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The manifest passes an explicit 3600; a hand-run `--every` should not
+        have to know the number."""
+        seen: dict[str, Any] = {}
+
+        def fake_forever(every: float, **kwargs: Any) -> None:
+            seen["every"] = every
+            raise self._Stop
+
+        monkeypatch.setattr(sync_module, "sync_forever", fake_forever)
+        with pytest.raises(self._Stop):
+            sync_module.main(["--every"])
+        assert seen["every"] == float(sync_module.REBUILD_INTERVAL)
+
+    def test_a_non_positive_interval_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`--every 0` is a busy loop hammering the docs repo, not a schedule."""
+        monkeypatch.setattr(
+            sync_module, "sync_forever", lambda *a, **k: pytest.fail("should not loop")
+        )
+        with pytest.raises(SystemExit):
+            sync_module.main(["--every", "0"])
+
+    def test_without_every_it_still_builds_once_and_exits(
+        self, tmp_path: Path, docs_checkout: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The development path and `python -m ... sync` must not become a
+        daemon by default."""
+        monkeypatch.setattr(
+            sync_module, "sync_forever", lambda *a, **k: pytest.fail("should not loop")
+        )
+        db = tmp_path / "docs.sqlite3"
+        assert (
+            sync_module.main(
+                [
+                    "--db-path",
+                    str(db),
+                    "--local-checkout",
+                    str(docs_checkout),
+                    "--site-base-url",
+                    SITE,
+                ]
+            )
+            == 0
+        )
+        assert db.exists()
 
 
 # --------------------------------------------------------------------------- #

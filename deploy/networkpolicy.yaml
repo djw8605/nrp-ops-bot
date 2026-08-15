@@ -15,6 +15,11 @@
 # A too-narrow rule here fails as a 30s timeout on every tool call, never as an
 # error naming the network -- so suspect this file first when the agent can
 # reach the LLM but not Kubernetes.
+#
+# NetworkPolicy selects pods, not containers, so this now also governs the
+# docs-sync sidecar's clone of gitlab.nrp-nautilus.io. That is covered by the
+# public-HTTPS rule at the bottom; narrowing that rule means adding the docs
+# host explicitly, or the index silently stops rebuilding.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -128,7 +133,7 @@ spec:
 #         - matchName: ellm.nrp-nautilus.io
 #         - matchName: slack.com
 #         - matchPattern: "*.slack.com"
-#         - matchName: gitlab.nrp-nautilus.io   # docs-sync CronJob only
+#         - matchName: gitlab.nrp-nautilus.io   # docs-sync sidecar only
 #       toPorts:
 #         - ports:
 #             - port: "443"

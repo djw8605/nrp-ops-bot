@@ -79,7 +79,9 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise ToolError(
             "docs_index_missing",
-            f"No docs index at {db_path}. The docs-sync CronJob has not run yet.",
+            f"No docs index at {db_path}. The docs-sync sidecar has not finished its "
+            "first build, or it is failing -- its log says which: "
+            "kubectl -n system-nrp-ops-bot logs deploy/nrp-ops-agent -c docs-sync",
         )
     # Read-only URI: this process must never be able to write the shared index.
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
