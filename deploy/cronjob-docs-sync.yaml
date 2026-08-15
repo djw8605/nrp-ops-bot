@@ -1,5 +1,8 @@
 ---
-# Rebuilds the documentation FTS5 index hourly onto the shared PVC.
+# Rebuilds the documentation FTS5 index onto the shared PVC.
+#
+# NOTE: currently on a temporary 10-minute debugging schedule; the steady-state
+# schedule is hourly and the values to restore are listed on `schedule` below.
 #
 # Hourly is affordable because a run is a `git clone --depth 1 --single-branch`
 # of one docs repo (~870 chunks) and a full rebuild, not an incremental diff --
@@ -7,9 +10,9 @@
 # could read a runbook edited that morning and get the pre-edit text back with a
 # confident nrp.ai citation, which is worse than a miss.
 #
-# concurrencyPolicy: Forbid plus activeDeadlineSeconds well under the interval
-# is what keeps hourly from stacking up: a slow run is killed at 30 minutes and
-# a run still going at the next tick suppresses it rather than doubling up.
+# concurrencyPolicy: Forbid plus activeDeadlineSeconds under the interval is
+# what keeps a short schedule from stacking up: a slow run is killed and a run
+# still going at the next tick suppresses it rather than doubling up.
 #
 # The build is atomic: chunks go into <db>.building and the file is renamed over
 # the live index only on success, so the agent never reads a half-built database.
@@ -24,16 +27,37 @@ metadata:
     app.kubernetes.io/name: nrp-ops-agent
     app.kubernetes.io/component: docs-sync
 spec:
-  # Offset from the hour to avoid the cluster-wide cron spike at :00.
-  schedule: "17 * * * *"
+  # ======================= TEMPORARY: DEBUGGING CADENCE =======================
+  # Every 10 minutes while the PVC permission failure is being chased, so a fix
+  # can be confirmed in minutes instead of at the top of the next hour.
+  #
+  # REVERT TO:  schedule: "17 * * * *"
+  #             failedJobsHistoryLimit: 3
+  #             activeDeadlineSeconds: 1800
+  # once the index builds. Nothing below expires on its own.
+  #
+  # Minute list rather than */10, which would fire at :00 and put this back in
+  # the cluster-wide cron spike the :17 offset existed to dodge.
+  schedule: "7,17,27,37,47,57 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
-  failedJobsHistoryLimit: 3
-  startingDeadlineSeconds: 600
+  # Raised from 3: at six runs an hour the last three failures cover half an
+  # hour, and a failed pod's logs are the whole point of the tighter schedule.
+  # Six keeps a full hour of evidence.
+  failedJobsHistoryLimit: 6
+  startingDeadlineSeconds: 300
   jobTemplate:
     spec:
       backoffLimit: 2
-      activeDeadlineSeconds: 1800
+      # Must stay under the 10-minute period. With Forbid, a run that outlives
+      # its slot suppresses the next tick; at 1800 a single hung run would
+      # silently eat three cycles, which during debugging looks like the
+      # CronJob having stopped firing.
+      #
+      # The clone is 3 attempts at a 600s timeout, so a genuinely wedged
+      # network can still hit this ceiling first -- that is the intended
+      # trade while debugging: fail fast and visibly, retry in ten minutes.
+      activeDeadlineSeconds: 540
       template:
         metadata:
           labels:
