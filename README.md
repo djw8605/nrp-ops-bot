@@ -360,6 +360,43 @@ reading the thread. Set `NRP_OPS_SLACK_THREAD_HISTORY_LIMIT=0` to turn thread re
 Not requested, deliberately: `channels:history`, `groups:history`, `users:read`, `files:read`. The
 agent authorizes on user ID and does not need the directory.
 
+### Replies are converted to Slack mrkdwn
+
+Slack does not render Markdown. Its `text` field takes *mrkdwn*, a much smaller syntax that overlaps
+just enough to be misleading: `**bold**` arrives as literal asterisks, `## Heading` as a literal
+hash, and `[the runbook](https://nrp.ai/x)` as literal brackets — so the doc links, the part an
+operator is meant to click to check a finding, arrive unclickable.
+
+Two things address this, and both are needed. The system prompt asks the model for mrkdwn, which
+gets most of the way there; `slack_format.py` then converts whatever actually came back, because
+models drift into Markdown on long answers and bulleted lists are exactly where they drift. The
+conversion is idempotent, which is what lets both run without fighting each other.
+
+| Markdown | Becomes |
+|---|---|
+| `**bold**`, `__bold__` | `*bold*` |
+| `~~strike~~` | `~strike~` |
+| `# Heading` | a bold line — mrkdwn has no headings |
+| `- item` | `•` / `◦` / `▪` by depth |
+| `[text](url)` | `<url\|text>` |
+| a pipe table | a code block — mrkdwn has no tables, monospace is the only alignment there is |
+| `---` | a rule of box-drawing characters |
+
+A single `*text*` is left exactly as written. Markdown reads it as italic and Slack reads it as
+bold, so no rendering satisfies both; since the prompt asks for mrkdwn, most of those runs were
+meant as Slack bold, and rewriting them would demote the words the model chose to emphasise.
+
+Code is why this is a segmenting parser and not a pile of regex substitutions. Operators get YAML,
+PromQL and log lines back, and those are full of `*`, `_` and `|` — rewriting emphasis inside a
+fenced block would corrupt the evidence the answer rests on. Fenced blocks and inline spans are
+lifted out before any prose rule runs and put back afterwards, changed only by the `&`/`<`/`>`
+escaping Slack requires everywhere. The tool trace is escaped the same way and never converted, so a
+selector in it stays byte-identical to what an operator would re-run by hand.
+
+Truncation to the 3500-character cap is fence-aware for the same reason: cutting mid-block would
+leave an unterminated ` ``` `, and Slack renders that as one code block swallowing the rest of the
+message — turning a merely-truncated answer into an unreadable one.
+
 ---
 
 ## Before you deploy

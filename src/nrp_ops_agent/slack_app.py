@@ -26,6 +26,7 @@ from nrp_ops_agent.agent import Agent, AgentResult, ThreadMessage
 from nrp_ops_agent.authz import Authorizer, SlackEvent
 from nrp_ops_agent.config import AllowlistLoader, Settings, get_allowlist_loader, get_settings
 from nrp_ops_agent.redact import redact
+from nrp_ops_agent.slack_format import escape_entities, fit, to_mrkdwn
 
 log = logging.getLogger("nrp_ops_agent.slack")
 
@@ -55,12 +56,17 @@ class SlackOps:
     # ------------------------------------------------------------ outbound --
 
     async def _post(self, client: Any, *, channel: str, thread_ts: str, text: str) -> str | None:
-        """Post to a thread. The outbound redaction chokepoint."""
+        """Post to a thread. The outbound redaction chokepoint.
+
+        Text arrives already in mrkdwn -- see :func:`format_reply`. Redaction
+        runs on it rather than on the Markdown, so what is audited is what was
+        one keystroke away from the channel.
+        """
         clean, rules = redact(text)
         if rules:
             audit.emit("redaction_hit", slack_channel=channel, redaction_rules=rules)
         response = await client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts, text=clean[:MAX_MESSAGE_CHARS]
+            channel=channel, thread_ts=thread_ts, text=fit(clean, MAX_MESSAGE_CHARS)
         )
         ts = response.get("ts")
         return str(ts) if ts else None
@@ -69,7 +75,7 @@ class SlackOps:
         clean, rules = redact(text)
         if rules:
             audit.emit("redaction_hit", slack_channel=channel, redaction_rules=rules)
-        await client.chat_update(channel=channel, ts=ts, text=clean[:MAX_MESSAGE_CHARS])
+        await client.chat_update(channel=channel, ts=ts, text=fit(clean, MAX_MESSAGE_CHARS))
 
     async def _react(self, client: Any, *, channel: str, ts: str) -> None:
         try:
@@ -180,7 +186,9 @@ class SlackOps:
                 )
             except Exception as exc:
                 log.exception("investigation failed")
-                text = f"The investigation failed: {type(exc).__name__}: {exc}"
+                # The exception string can carry a URL or an angle-bracketed
+                # repr; escaped so Slack shows it rather than eating it.
+                text = escape_entities(f"The investigation failed: {type(exc).__name__}: {exc}")
                 if ack_ts:
                     await self._update(client, channel=event.channel, ts=ack_ts, text=text)
                 else:
@@ -230,15 +238,24 @@ def _fit_char_budget(history: list[ThreadMessage], budget: int) -> list[ThreadMe
 
 
 def format_reply(result: AgentResult) -> str:
-    """Finding first, then the tool trace.
+    """Finding first, then the tool trace, in Slack mrkdwn.
 
     The trace is not optional. Operators will not act on a diagnosis they cannot
     audit, and the trace is what lets them re-run the same queries by hand.
+
+    The model's own text is the only part that arrives as Markdown, so it is the
+    only part converted; everything below is written as mrkdwn already and would
+    be damaged by a second pass over it.
     """
-    parts = [result.text.strip()]
+    parts = [to_mrkdwn(result.text.strip())]
 
     if result.tool_calls:
-        lines = [f"  {index}. {call.render()}" for index, call in enumerate(result.tool_calls, 1)]
+        # Escaped, not converted: a PromQL selector is full of characters Slack
+        # reads as markup, and inside a fence they must survive verbatim.
+        lines = [
+            f"  {index}. {escape_entities(call.render())}"
+            for index, call in enumerate(result.tool_calls, 1)
+        ]
         parts.append(
             "*Tool calls* (" + str(len(result.tool_calls)) + ")\n```\n" + "\n".join(lines) + "\n```"
         )

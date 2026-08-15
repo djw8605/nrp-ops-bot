@@ -309,7 +309,8 @@ class TestFormatReply:
                 )
             ],
         )
-        assert "-> namespace_denied" in format_reply(result)
+        # `>` reaches Slack escaped, as Slack asks for, and renders back as `->`.
+        assert "-&gt; namespace_denied" in format_reply(result)
 
     def test_footnotes_report_budget_and_redaction(self) -> None:
         result = AgentResult(
@@ -325,6 +326,49 @@ class TestFormatReply:
 
     def test_a_clean_answer_has_no_footnote_line(self) -> None:
         assert format_reply(AgentResult(text="all healthy")) == "all healthy"
+
+
+class TestReplyIsSlackFormatted:
+    """Slack renders mrkdwn, not Markdown. The model writes Markdown, so an
+    answer used to arrive with literal `**`, `##` and `[label](url)` in it --
+    and the doc links, the part an operator clicks to check the finding, were
+    not links at all."""
+
+    def test_model_markdown_is_converted(self) -> None:
+        out = format_reply(
+            AgentResult(
+                text="## Finding\n\n**coder-0** is OOMKilled.\n\n- see [docs](https://nrp.ai/c)"
+            )
+        )
+        assert "**" not in out and "##" not in out
+        assert "*Finding*" in out
+        assert "*coder-0* is OOMKilled." in out
+        assert "• see <https://nrp.ai/c|docs>" in out
+
+    def test_the_tool_trace_is_not_run_through_the_converter(self) -> None:
+        """Arguments are verbatim evidence. A PromQL selector is full of `*` and
+        `_`, and rewriting them as emphasis would corrupt what it re-runs as."""
+        result = AgentResult(
+            text="see below",
+            tool_calls=[ToolCallRecord("promql", {"query": "sum(a) * 100 / b_c_d"}, True, 5.0, 20)],
+        )
+        assert "sum(a) * 100 / b_c_d" in format_reply(result)
+
+    async def test_the_posted_message_is_mrkdwn(self) -> None:
+        ops = make_ops(AgentResult(text="**coder-0** restarted 47 times"))
+        client = FakeSlackClient()
+        await ops.handle(event(), client)
+        assert "*coder-0* restarted 47 times" in client.updated[-1]["text"]
+
+    async def test_a_truncated_answer_does_not_leave_a_fence_open(self) -> None:
+        """An unterminated ``` makes Slack render the rest of the message as one
+        code block, turning a truncated answer into an unreadable one."""
+        ops = make_ops(AgentResult(text="intro\n```\n" + "a log line\n" * 2000))
+        client = FakeSlackClient()
+        await ops.handle(event(), client)
+        text = client.updated[-1]["text"]
+        assert len(text) <= 3500
+        assert text.count("```") % 2 == 0
 
 
 class TestDmHandling:
