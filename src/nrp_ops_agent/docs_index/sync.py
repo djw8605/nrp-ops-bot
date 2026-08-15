@@ -22,6 +22,7 @@ vector search on a corpus this full of identifiers, so it is not built yet.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sqlite3
@@ -265,8 +266,59 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
 # which is what the tokenchars above buy; the default tokenizer would shred them.
 
 
+class IndexDirectoryUnwritable(RuntimeError):
+    """The index directory exists but this process cannot create files in it."""
+
+
+def _describe_permissions(directory: Path) -> str:
+    """Owner, mode and the identity we are trying to write as.
+
+    `sqlite3.connect` reports every one of these as "unable to open database
+    file", which is indistinguishable from a missing path. On a CephFS PVC the
+    answer is almost always that the volume root is owned by root with mode
+    0755 and fsGroup was never applied, so both halves of the comparison have to
+    be in the message for it to be actionable.
+    """
+    try:
+        st = directory.stat()
+        owner = f"uid={st.st_uid} gid={st.st_gid} mode={st.st_mode & 0o7777:04o}"
+    except OSError as exc:
+        owner = f"could not stat ({exc})"
+    running = f"uid={os.getuid()} gid={os.getgid()} groups={sorted(os.getgroups())}"
+    return f"{directory} is {owner}; this process runs as {running}"
+
+
+def require_writable_index_dir(db_path: Path) -> None:
+    """Fail early and legibly if the index cannot be written.
+
+    Called before the clone rather than after it: a permissions problem is not
+    worth a 30-second checkout to discover, and the previous ordering buried the
+    real fault under a traceback from deep inside build_index.
+    """
+    directory = db_path.parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise IndexDirectoryUnwritable(
+            f"cannot create the index directory: {_describe_permissions(directory)} ({exc})"
+        ) from exc
+
+    probe = directory / ".docs-sync-write-probe"
+    try:
+        probe.touch()
+        probe.unlink()
+    except OSError as exc:
+        raise IndexDirectoryUnwritable(
+            f"cannot write the docs index: {_describe_permissions(directory)} ({exc}). "
+            "The PVC is mounted but not writable by this user. Either the CephFS CSI driver "
+            "is not applying fsGroup (fsGroupPolicy must be File, not None), or the volume "
+            "root is owned by another uid. Confirm with: kubectl -n system-nrp-ops-bot exec "
+            "deploy/nrp-ops-agent -- ls -lnd /var/lib/nrp-ops-agent"
+        ) from exc
+
+
 def build_index(chunks: list[Chunk], db_path: Path) -> int:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    require_writable_index_dir(db_path)
     tmp_path = db_path.with_suffix(db_path.suffix + ".building")
     tmp_path.unlink(missing_ok=True)
 
@@ -345,6 +397,10 @@ def sync(
     repo_url = repo_url or settings.docs_repo_url
     db_path = db_path or settings.docs_db_path
     site_base_url = (site_base_url or settings.docs_site_base_url).rstrip("/")
+
+    # Before the clone: a volume this job cannot write to fails the run whatever
+    # the checkout produces, and finding that out first makes the log say so.
+    require_writable_index_dir(db_path)
 
     tmpdir: str | None = None
     try:

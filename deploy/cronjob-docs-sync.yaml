@@ -55,11 +55,30 @@ spec:
           # and has no business reaching the Kubernetes API.
           automountServiceAccountToken: false
           serviceAccountName: default
+          # fsGroup is what is supposed to make the CephFS PVC writable by 65532.
+          # On 2026-08-16 it did not: the run got past the clone and died in
+          # sqlite3.connect with "unable to open database file", which is what a
+          # mounted-but-unwritable volume looks like from Python.
+          #
+          # kubelet only chowns a CSI volume when the driver advertises
+          # fsGroupPolicy: File. Rook's CephFS driver does by default on recent
+          # versions; if this cluster's does not, fsGroup here is silently
+          # ignored and the volume root stays root:root 0755.
+          #
+          # Check which it is -- the agent pod already mounts the same PVC:
+          #   kubectl -n system-nrp-ops-bot exec deploy/nrp-ops-agent \
+          #     -- ls -lnd /var/lib/nrp-ops-agent
+          #
+          # If it is root-owned, the fix is on the driver
+          # (CSI_FSGROUPPOLICY=File in the Rook operator) or on the volume, not
+          # here: this namespace enforces restricted Pod Security, so an
+          # initContainer cannot run as root to chown it.
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532
             runAsGroup: 65532
             fsGroup: 65532
+            fsGroupChangePolicy: OnRootMismatch
             seccompProfile:
               type: RuntimeDefault
           containers:

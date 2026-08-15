@@ -8,6 +8,7 @@ fenced code, deep heading nesting, and the identifiers operators search on
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import subprocess
@@ -20,10 +21,12 @@ from helpers import ns
 from nrp_ops_agent.docs_index import sync as sync_module
 from nrp_ops_agent.docs_index.sync import (
     CloneFailed,
+    IndexDirectoryUnwritable,
     build_index,
     chunk_by_heading,
     clone_docs,
     iter_chunks,
+    require_writable_index_dir,
     section_for,
     split_frontmatter,
     strip_mdx,
@@ -310,6 +313,54 @@ class TestCloneFailureIsLegible:
         monkeypatch.setattr(sync_module, "sync", boom)
         assert sync_module.main(["--db-path", str(tmp_path / "x.sqlite3")]) == 1
         assert "Could not resolve host" in capsys.readouterr().err.strip().splitlines()[-1]
+
+    @pytest.mark.skipif(os.getuid() == 0, reason="root bypasses file permission checks")
+    def test_an_unwritable_index_dir_names_both_sides_of_the_mismatch(self, tmp_path: Path) -> None:
+        """sqlite3 reports this as "unable to open database file", which reads
+        like a missing path. The error has to name the directory's owner *and*
+        the uid trying to write, or there is nothing to act on."""
+        locked = tmp_path / "pvc"
+        locked.mkdir()
+        locked.chmod(0o555)
+        try:
+            with pytest.raises(IndexDirectoryUnwritable) as exc:
+                require_writable_index_dir(locked / "docs.sqlite3")
+        finally:
+            locked.chmod(0o755)
+        message = str(exc.value)
+        assert str(locked) in message
+        assert "mode=0555" in message
+        assert f"uid={os.getuid()}" in message
+        assert "fsGroup" in message
+
+    def test_an_uncreatable_index_dir_is_reported(self, tmp_path: Path) -> None:
+        """Same failure, reached without depending on mode bits so it holds when
+        the suite runs as root."""
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("x", encoding="utf-8")
+        with pytest.raises(IndexDirectoryUnwritable, match="index directory"):
+            require_writable_index_dir(blocker / "sub" / "docs.sqlite3")
+
+    def test_the_check_runs_before_the_clone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A volume that cannot be written fails the run whatever the checkout
+        holds, so spending a clone to discover it is wasted time and a more
+        confusing log."""
+
+        def fake_clone(*args: Any, **kwargs: Any) -> Path:
+            raise AssertionError("clone should not have been attempted")
+
+        monkeypatch.setattr(sync_module, "clone_docs", fake_clone)
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("x", encoding="utf-8")
+        with pytest.raises(IndexDirectoryUnwritable):
+            sync(db_path=blocker / "sub" / "docs.sqlite3", site_base_url=SITE)
+
+    def test_a_writable_dir_passes(self, tmp_path: Path) -> None:
+        require_writable_index_dir(tmp_path / "docs.sqlite3")
+        # The probe must not survive the check.
+        assert list(tmp_path.iterdir()) == []
 
     def test_a_missing_docs_dir_names_what_was_there_instead(self, tmp_path: Path) -> None:
         checkout = tmp_path / "co"
