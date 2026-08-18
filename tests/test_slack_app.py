@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 from typing import Any
@@ -60,8 +61,9 @@ class FakeSlackClient:
 
 
 class FakeAgent:
-    def __init__(self, result: AgentResult | Exception) -> None:
+    def __init__(self, result: AgentResult | Exception, takes_s: float = 0.0) -> None:
         self._result = result
+        self._takes_s = takes_s
         self.calls: list[str] = []
         self.histories: list[list[ThreadMessage]] = []
         self.thread_keys: list[str | None] = []
@@ -79,17 +81,22 @@ class FakeAgent:
         self.thread_keys.append(thread_key)
         if progress is not None:
             await progress("checking: list_pods")
+        # A turn that takes real time, so the heartbeat has something to beat
+        # through. Slow only in the tests that ask for it.
+        if self._takes_s:
+            await asyncio.sleep(self._takes_s)
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
 
 
-def make_ops(result: AgentResult | Exception, **cfg: Any) -> SlackOps:
+def make_ops(result: AgentResult | Exception, takes_s: float = 0.0, **cfg: Any) -> SlackOps:
     settings = Settings(_env_file=None, slack_team_id=TEAM, llm_model="m", **cfg)
     allowlist = Allowlist(operators=[OPERATOR], channels=[CHANNEL])
     loader = StubLoader(allowlist)
     authorizer = Authorizer(settings, loader, TokenBucket(100))
-    return SlackOps(settings, authorizer, FakeAgent(result), loader)  # type: ignore[arg-type]
+    agent = FakeAgent(result, takes_s=takes_s)
+    return SlackOps(settings, authorizer, agent, loader)  # type: ignore[arg-type]
 
 
 def event(**overrides: Any) -> SlackEvent:
@@ -145,6 +152,50 @@ class TestAllowPath:
         assert len(client.updated) == 2
         assert "checking: list_pods" in client.updated[0]["text"]
         assert "OOMKilled" in client.updated[-1]["text"]
+
+    async def test_a_long_turn_says_it_is_still_thinking(self) -> None:
+        """A three-month accounting question can spend a minute inside one model
+        call. Without this the thread shows "checking: ..." and then nothing,
+        which is indistinguishable from a wedged bot."""
+        ops = make_ops(
+            AgentResult(text="qwen3-small leads"),
+            takes_s=0.25,
+            slack_progress_heartbeat_s=0.05,
+        )
+        client = FakeSlackClient()
+        await ops.handle(event(), client)
+
+        beats = [u["text"] for u in client.updated if "still thinking" in u["text"]]
+        assert beats, [u["text"] for u in client.updated]
+        # It reports how long it has been waiting, and keeps the tool line so
+        # the reader can still see what it is doing.
+        assert "still thinking after" in beats[0]
+        assert "checking: list_pods" in beats[0]
+        # The answer is the last word, not a heartbeat.
+        assert "qwen3-small leads" in client.updated[-1]["text"]
+
+    async def test_the_heartbeat_stops_when_the_turn_does(self) -> None:
+        ops = make_ops(AgentResult(text="done"), takes_s=0.05, slack_progress_heartbeat_s=0.02)
+        client = FakeSlackClient()
+        await ops.handle(event(), client)
+        before = len(client.updated)
+        await asyncio.sleep(0.1)
+        assert len(client.updated) == before
+
+    async def test_a_failed_turn_also_stops_the_heartbeat(self) -> None:
+        ops = make_ops(RuntimeError("boom"), takes_s=0.05, slack_progress_heartbeat_s=0.02)
+        client = FakeSlackClient()
+        await ops.handle(event(), client)
+        before = len(client.updated)
+        await asyncio.sleep(0.1)
+        assert len(client.updated) == before
+        assert "boom" in client.updated[-1]["text"]
+
+    async def test_the_heartbeat_can_be_turned_off(self) -> None:
+        ops = make_ops(AgentResult(text="done"), takes_s=0.1, slack_progress_heartbeat_s=0.0)
+        client = FakeSlackClient()
+        await ops.handle(event(), client)
+        assert not any("still thinking" in u["text"] for u in client.updated)
 
     async def test_replies_into_an_existing_thread(self) -> None:
         ops = make_ops(AgentResult(text="ok"))
@@ -359,6 +410,18 @@ class TestFormatReply:
 
     def test_a_clean_answer_has_no_footnote_line(self) -> None:
         assert format_reply(AgentResult(text="all healthy")) == "all healthy"
+
+    def test_the_waiting_note_reads_as_a_clock(self) -> None:
+        from nrp_ops_agent.slack_app import _Waiting
+
+        assert _Waiting().render() == ACK_TEXT
+        assert _Waiting(line="checking: get_logs").render().endswith("_checking: get_logs_")
+        # Seconds while they are still readable as seconds, then minutes: a turn
+        # on a quarter of accounting data can run past both.
+        assert "still thinking after 60s" in _Waiting(waited=60).render()
+        assert "still thinking after 2m05s" in _Waiting(waited=125).render()
+        both = _Waiting(line="checking: accounting_chart", waited=90).render()
+        assert "checking: accounting_chart · still thinking after 90s" in both
 
     def test_a_truncated_answer_says_so_in_the_thread(self) -> None:
         """The bug this footnote exists for: an answer cut off at the model's

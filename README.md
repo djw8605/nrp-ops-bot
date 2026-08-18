@@ -269,9 +269,33 @@ claiming an answer with no text in it.
 
 `NRP_OPS_LLM_MAX_TOKENS` is the served model's own documented ceiling (100k for deepseek-v4, which
 carries a 1M-token context), not a house style. It is a ceiling and not a target: what actually
-bounds a long generation is `NRP_OPS_LLM_TIMEOUT_S` (90 s) and the 120 s wall clock, and the Slack
-reply is capped at 3500 characters regardless. Raising it buys headroom for reasoning tokens, not
-longer replies.
+bounds a long generation is `NRP_OPS_LLM_TIMEOUT_S` and the wall clock below, and the Slack reply is
+capped at 3500 characters regardless. Raising it buys headroom for reasoning tokens, not longer
+replies — and it moved the failure from a truncated answer to a timed-out turn, which is what the
+next section is about.
+
+### How long a turn may take, and saying so
+
+The wall clock is the turn budget, and with `max_tokens` at the model's own ceiling it is the limit
+that actually binds. A five-tool-call accounting turn grows its prompt to ~60k tokens, and the model
+call that writes the answer is the one that has to prefill all of them — 24s at 26k tokens, ~70s and
+counting at 63k. At 120s those turns died at the deadline with the chart already uploaded and the
+prose lost (`reply_sent` `reason: "timeout"`), so the budget is 300s, with `NRP_OPS_LLM_TIMEOUT_S` at
+180s so a single slow call finishes rather than being cut off as a transport error.
+
+Waiting minutes is only tolerable if the thread says it is waiting. The ack message is edited when a
+tool runs, but the expensive part comes *after* the last tool, so a thread could sit unchanged for
+two minutes while everything was fine — indistinguishable from a wedged bot. A heartbeat
+(`NRP_OPS_SLACK_PROGRESS_HEARTBEAT_S`, 60s) edits it on a timer instead:
+
+```
+on it -- investigating...
+_checking: accounting_chart · still thinking after 2m00s_
+```
+
+It keeps the last tool line beside the clock, switches from seconds to `2m05s` past two minutes, and
+is cancelled before the answer is written, so a beat can never land on top of a finished reply. A
+failed edit is logged and swallowed — a rate-limited heartbeat must not cost the turn.
 
 ### A follow-up does not re-run the investigation
 
@@ -303,6 +327,7 @@ endpoint, credential, namespace or Slack ID is hardcoded anywhere else in the pa
 | `NRP_OPS_SLACK_ALLOW_DMS` | `true` | |
 | `NRP_OPS_SLACK_THREAD_HISTORY_LIMIT` | `20` | earlier thread messages read for context; `0` disables |
 | `NRP_OPS_SLACK_THREAD_HISTORY_CHAR_BUDGET` | `12000` | oldest thread turns dropped past this |
+| `NRP_OPS_SLACK_PROGRESS_HEARTBEAT_S` | `60` | edits the ack to say it is still working; `0` disables |
 | `NRP_OPS_ALLOWLIST_PATH` | `/etc/nrp-ops-agent/allowlist.yaml` | ConfigMap-mounted, hot-reloaded |
 | `NRP_OPS_RATE_LIMIT_PER_HOUR` | `10` | per-user token bucket |
 | `NRP_OPS_KUBE_MODE` | `auto` | `auto` \| `incluster` \| `kubeconfig` |
@@ -318,10 +343,11 @@ endpoint, credential, namespace or Slack ID is hardcoded anywhere else in the pa
 | `NRP_OPS_LLM_BASE_URL` | `https://ellm.nrp-nautilus.io/v1` | `/v1` verified; POST needs a key |
 | `NRP_OPS_LLM_API_KEY` / `_MODEL` | — | `_MODEL` has no default on purpose |
 | `NRP_OPS_LLM_TEMPERATURE` / `_MAX_TOKENS` | `0.0` / `100000` | the served model's own output ceiling; see below |
+| `NRP_OPS_LLM_TIMEOUT_S` | `180` | one model call; must stay under the wall clock |
 | `NRP_OPS_AGENT_MAX_TOOL_CALLS` | `12` | per turn |
 | `NRP_OPS_AGENT_MAX_ITERATIONS` | `8` | loop iterations |
 | `NRP_OPS_AGENT_MAX_TRUNCATION_RETRIES` | `1` | re-asks for a shorter answer when one is cut off; `0` posts the partial, marked |
-| `NRP_OPS_AGENT_WALL_CLOCK_TIMEOUT_S` | `120` | the real bound on generation once `_MAX_TOKENS` is this high |
+| `NRP_OPS_AGENT_WALL_CLOCK_TIMEOUT_S` | `300` | the whole turn; the real bound once `_MAX_TOKENS` is this high |
 | `NRP_OPS_AGENT_TOOL_OUTPUT_TOKEN_BUDGET` | `60000` | oldest results dropped past this |
 | `NRP_OPS_AGENT_THREAD_MEMO_CHAR_BUDGET` | `20000` | previous turn's tool results carried into a follow-up; `0` disables |
 | `NRP_OPS_AGENT_THREAD_MEMO_TTL_S` | `1800` | past this a follow-up starts clean |

@@ -55,6 +55,16 @@ class TestSettings:
         monkeypatch.setenv("NRP_OPS_LLM_MAX_TOKENS", "100000")
         assert Settings(_env_file=None).llm_max_tokens == 100_000
 
+    def test_a_turn_gets_longer_than_two_minutes(self) -> None:
+        """120s could not hold a five-tool-call accounting turn: prompts grow to
+        60k tokens and the model call that writes the answer is the one that
+        prefills all of them. The turn died at the deadline instead."""
+        settings = Settings(_env_file=None)
+        assert settings.agent_wall_clock_timeout_s == 300.0
+        # No use giving the turn five minutes if the HTTP client hangs up at 90s.
+        assert settings.llm_timeout_s == 180.0
+        assert settings.llm_timeout_s < settings.agent_wall_clock_timeout_s
+
     def test_settings_are_frozen(self) -> None:
         settings = Settings(_env_file=None)
         with pytest.raises(ValueError, match="frozen"):

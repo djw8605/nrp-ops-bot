@@ -83,6 +83,16 @@ class Settings(BaseSettings):
         description="Cap on total characters of thread history sent to the model. The "
         "oldest messages are dropped first, so the turns nearest the question survive.",
     )
+    # A turn can spend minutes in a single model call on a quarter-long
+    # accounting question. The ack message is edited when a tool runs, but
+    # between the last tool and the answer nothing moves, and a thread that has
+    # said nothing for two minutes is indistinguishable from a wedged bot.
+    slack_progress_heartbeat_s: float = Field(
+        default=60.0,
+        ge=0,
+        description="How often the ack message is edited to say it is still working, "
+        "while a turn runs. 0 disables it.",
+    )
 
     # ---------------------------------------------------------------- Authz --
     allowlist_path: Path = Field(
@@ -200,7 +210,11 @@ class Settings(BaseSettings):
     # 100k of output. Generation is bounded in practice by `llm_timeout_s` and
     # `agent_wall_clock_timeout_s`, which stop a runaway long before 100k tokens.
     llm_max_tokens: int = Field(default=100_000, ge=1, le=1_000_000)
-    llm_timeout_s: float = Field(default=90.0, gt=0, le=600)
+    # Must stay under `agent_wall_clock_timeout_s`, and comfortably above the
+    # slowest single call: a turn whose context has grown to 60k tokens spends
+    # most of a minute in prefill before the answer starts, and 90s cut those
+    # calls off as a transport error rather than letting them finish.
+    llm_timeout_s: float = Field(default=180.0, gt=0, le=600)
 
     # ----------------------------------------------------------------- Agent --
     agent_max_tool_calls: int = Field(default=12, ge=1, le=64)
@@ -212,7 +226,13 @@ class Settings(BaseSettings):
         description="How many times an answer cut off at the output limit is discarded "
         "and asked for again, shorter. 0 posts the partial answer, marked as truncated.",
     )
-    agent_wall_clock_timeout_s: float = Field(default=120.0, gt=0, le=900)
+    # The turn budget, and the limit that actually binds now that `max_tokens`
+    # is the model's own ceiling. A five-tool-call accounting turn grows its
+    # prompt to ~60k tokens, and the model call that writes the answer is the one
+    # that has to prefill all of them: 120s killed those turns at the deadline
+    # with the chart already uploaded and the prose lost. Operators are not left
+    # guessing during the wait -- see `slack_progress_heartbeat_s`.
+    agent_wall_clock_timeout_s: float = Field(default=300.0, gt=0, le=900)
     # A follow-up in a thread ("continue", "is it still broken?") reaches the
     # model with the bot's earlier *text* but none of the tool results behind it,
     # so it re-runs the whole investigation to answer. The last turn's tool

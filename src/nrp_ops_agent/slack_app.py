@@ -20,9 +20,12 @@ Denied messages get an emoji reaction and nothing else. See
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from nrp_ops_agent import audit, charts
@@ -37,6 +40,38 @@ log = logging.getLogger("nrp_ops_agent.slack")
 #: Slack hard-limits a message to 4000 characters; stay well under it.
 MAX_MESSAGE_CHARS = 3500
 ACK_TEXT = "on it -- investigating..."
+
+
+@dataclass
+class _Waiting:
+    """What the ack message should say while a turn is still running."""
+
+    #: The most recent tool line, e.g. ``checking: accounting_chart``.
+    line: str = ""
+    #: Whole seconds waited, as last reported by the heartbeat. 0 until it beats.
+    waited: int = 0
+
+    def render(self) -> str:
+        notes = [note for note in (self.line, self._elapsed()) if note]
+        if not notes:
+            return ACK_TEXT
+        return f"{ACK_TEXT}\n_{' · '.join(notes)}_"
+
+    def _elapsed(self) -> str:
+        if not self.waited:
+            return ""
+        if self.waited < 120:
+            return f"still thinking after {self.waited}s"
+        return f"still thinking after {self.waited // 60}m{self.waited % 60:02d}s"
+
+
+async def _quiet(beat: asyncio.Task[None] | None) -> None:
+    """Stop the heartbeat and wait for it to actually be gone."""
+    if beat is None:
+        return
+    beat.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await beat
 
 
 class SlackOps:
@@ -137,6 +172,26 @@ class SlackOps:
         except Exception:
             log.debug("could not add deny reaction", exc_info=True)
 
+    async def _heartbeat(self, waiting: _Waiting, show: Any) -> None:
+        """Edit the ack every interval so a long turn visibly keeps working.
+
+        The ack message moves when a tool runs, but the expensive part of a big
+        question is the model call *after* the last tool: a thread can sit
+        unchanged for minutes while everything is fine, which reads exactly like
+        a wedged bot. Beating on a timer rather than on tool calls is the point.
+
+        Cancelled by :func:`_quiet` when the turn ends. Failures inside ``show``
+        are swallowed there, so a rate-limited edit cannot end the turn.
+        """
+        interval = self._settings.slack_progress_heartbeat_s
+        started = time.monotonic()
+        while True:
+            await asyncio.sleep(interval)
+            # At least a second: a beat that reports "0s" reads as a bug, and
+            # rounding keeps a 59.6s first beat from announcing 59.
+            waiting.waited = max(1, round(time.monotonic() - started))
+            await show()
+
     # -------------------------------------------------------------- inbound --
 
     async def _thread_history(self, client: Any, event: SlackEvent) -> list[ThreadMessage]:
@@ -223,25 +278,46 @@ class SlackOps:
                 client, channel=event.channel, thread_ts=event.reply_thread_ts, text=ACK_TEXT
             )
 
+            waiting = _Waiting()
+
+            async def show() -> None:
+                if not ack_ts:
+                    return
+                try:
+                    await self._update(
+                        client, channel=event.channel, ts=ack_ts, text=waiting.render()
+                    )
+                except Exception:
+                    log.debug("progress update failed", exc_info=True)
+
             async def progress(line: str) -> None:
-                if ack_ts:
-                    try:
-                        await self._update(
-                            client, channel=event.channel, ts=ack_ts, text=f"{ACK_TEXT}\n_{line}_"
-                        )
-                    except Exception:
-                        log.debug("progress update failed", exc_info=True)
+                waiting.line = line
+                await show()
+
+            # Beats for as long as the turn runs. Cancelled in the `finally`
+            # below, before the answer is written, so a heartbeat can never land
+            # on top of a finished reply.
+            beat = (
+                asyncio.create_task(self._heartbeat(waiting, show))
+                if ack_ts and self._settings.slack_progress_heartbeat_s > 0
+                else None
+            )
 
             try:
-                result = await self._agent.investigate(
-                    event.text,
-                    history=history,
-                    progress=progress,
-                    # Channel included: the same parent timestamp can exist in
-                    # two channels, and one thread's results must not surface in
-                    # another's.
-                    thread_key=f"{event.channel}:{event.reply_thread_ts}",
-                )
+                try:
+                    result = await self._agent.investigate(
+                        event.text,
+                        history=history,
+                        progress=progress,
+                        # Channel included: the same parent timestamp can exist in
+                        # two channels, and one thread's results must not surface
+                        # in another's.
+                        thread_key=f"{event.channel}:{event.reply_thread_ts}",
+                    )
+                finally:
+                    # Inner finally, so the beat is stopped before either the
+                    # answer or the failure below is written into its message.
+                    await _quiet(beat)
             except Exception as exc:
                 log.exception("investigation failed")
                 # The exception string can carry a URL or an angle-bracketed
