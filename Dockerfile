@@ -42,10 +42,14 @@ COPY --from=builder /opt/venv /opt/venv
 # writable path under readOnlyRootFilesystem. git resolves HOME even for an
 # anonymous clone, so pointing it there keeps the docs-sync sidecar from failing
 # on a read-only filesystem.
+# MPLCONFIGDIR for the same reason as HOME: matplotlib writes a font cache on
+# first import and falls back to a warning plus a rebuild on every chart if it
+# cannot. /tmp is the emptyDir both containers mount, and the cache is ~1MB.
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HOME=/tmp
+    HOME=/tmp \
+    MPLCONFIGDIR=/tmp/matplotlib
 
 # 65532 ("nonroot") matches runAsUser in the Deployment. Declared here as well
 # so the image is correct on its own, rather than only under that one manifest.

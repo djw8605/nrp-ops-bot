@@ -42,6 +42,7 @@ AuditEvent = Literal[
     "redaction_hit",
     "reply_sent",
     "thread_history",
+    "chart_upload",
     "startup",
     "policy_reload",
 ]

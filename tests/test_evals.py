@@ -33,8 +33,11 @@ def call(
 
 
 class TestCaseFile:
-    def test_twenty_cases_are_defined(self) -> None:
-        assert len(load_cases()) == 20
+    def test_the_suite_is_not_truncated(self) -> None:
+        # A floor, not an exact count: pinning the number turns every case added
+        # to the suite into a test edit that carries no signal, which is the
+        # same reason the tool count stopped being pinned.
+        assert len(load_cases()) >= 20
 
     def test_case_ids_are_unique_and_tools_are_real(self) -> None:
         assert validate(load_cases()) == []
@@ -176,7 +179,7 @@ class TestCli:
     ) -> None:
         assert main(["--dry-run"]) == 0
         out = capsys.readouterr().out
-        assert "20 cases valid" in out
+        assert f"{len(load_cases())} cases valid" in out
 
     def test_missing_model_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import run_evals

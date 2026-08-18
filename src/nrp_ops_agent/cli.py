@@ -21,11 +21,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from pathlib import Path
 
 from nrp_ops_agent import audit
 from nrp_ops_agent.agent import Agent, AgentResult
 from nrp_ops_agent.config import get_allowlist_loader, get_settings
 from nrp_ops_agent.playbooks import get_playbooks
+from nrp_ops_agent.tools.accounting import aclose as aclose_accounting
 from nrp_ops_agent.tools.k8s import aclose_clients
 
 
@@ -103,6 +105,25 @@ async def _investigate(question: str, *, quiet: bool, show_tools: bool) -> Agent
     finally:
         await agent.aclose()
         await aclose_clients()
+        await aclose_accounting()
+
+
+def _save_charts(result: AgentResult, directory: Path) -> list[Path]:
+    """Write any charts the turn drew, so they can be looked at.
+
+    In Slack these are uploaded to the thread. Here there is nowhere to put an
+    image, and a chart nobody opens is a feature that only appears to work --
+    so the terminal path writes the file and prints where it went.
+    """
+    if not result.charts:
+        return []
+    directory.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for index, chart in enumerate(result.charts, start=1):
+        path = directory / f"{index:02d}-{chart.filename}"
+        path.write_bytes(chart.png)
+        written.append(path)
+    return written
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -119,6 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--quiet", action="store_true", help="Suppress the live progress lines on stderr."
+    )
+    parser.add_argument(
+        "--charts-dir",
+        type=Path,
+        default=Path("./charts"),
+        help="Where to write any charts the answer drew. Default: ./charts",
     )
     parser.add_argument(
         "--which-playbook",
@@ -165,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
 
     result = asyncio.run(_investigate(question, quiet=args.quiet, show_tools=args.show_tools))
     print(_render(result, show_tools=args.show_tools))
+    for path in _save_charts(result, args.charts_dir):
+        print(f"--- chart written to {path}")
     return 0 if result.ok else 1
 
 

@@ -15,10 +15,15 @@ Security role:
 * Nothing here can raise into the Slack handler: model faults, tool faults and
   timeouts all become a reported outcome.
 
+* Charts drawn by a tool are collected out of band (see
+  :mod:`nrp_ops_agent.charts`) and returned on :class:`AgentResult`. Image bytes
+  never enter the conversation -- the model sees only the numbers it plotted.
+
 Budgets (all env-driven): max tool calls per turn, max loop iterations, wall
-clock timeout, and a cap on accumulated tool output. When the output cap is
-exceeded the oldest tool results are dropped and the model is *told* they were
-dropped, so it does not silently reason from a truncated picture.
+clock timeout, a cap on accumulated tool output, and a cap on charts per reply.
+When the output cap is exceeded the oldest tool results are dropped and the
+model is *told* they were dropped, so it does not silently reason from a
+truncated picture.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from typing import Any, Final
 
 import httpx
 
-from nrp_ops_agent import audit
+from nrp_ops_agent import audit, charts
 from nrp_ops_agent.config import Settings, get_allowlist_loader, get_settings
 from nrp_ops_agent.playbooks import get_playbooks
 from nrp_ops_agent.prompts import (
@@ -103,6 +108,10 @@ class AgentResult:
     stop_reason: str = "answered"
     redaction_rules: list[str] = field(default_factory=list)
     dropped_results: int = 0
+    #: Images drawn during this turn, for the caller to upload. They travel
+    #: beside the text rather than inside it: a tool result is JSON in the model
+    #: context, and a PNG is neither.
+    charts: list[charts.Chart] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -211,6 +220,25 @@ class Agent:
     # ------------------------------------------------------------ the loop --
 
     async def investigate(
+        self,
+        message: str,
+        *,
+        history: Sequence[ThreadMessage] | None = None,
+        progress: ProgressFn | None = None,
+    ) -> AgentResult:
+        """One investigation, with any charts it drew attached to the result.
+
+        The collector wraps the whole loop rather than each tool call so that a
+        turn's chart budget is a turn's, not a tool's, and so that every exit
+        path -- answered, timed out, budget exhausted -- carries the pictures
+        drawn before it.
+        """
+        with charts.collecting(self._settings.charts_max_per_turn) as collector:
+            result = await self._run(message, history=history, progress=progress)
+        result.charts = list(collector.charts)
+        return result
+
+    async def _run(
         self,
         message: str,
         *,

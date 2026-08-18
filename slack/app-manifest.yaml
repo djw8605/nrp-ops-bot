@@ -29,10 +29,12 @@ display_information:
   background_color: "#1f2d3d"
   long_description: >-
     Answers operator questions about the National Research Platform cluster by
-    investigating it read-only: pods, events, workloads, nodes, PromQL and the
-    nrp.ai documentation. It cannot exec, port-forward, read Secrets, or write
-    anything at all -- those are denied in RBAC, not by prompting. Replies land
-    in-thread with the finding, the evidence, and the exact tool calls made.
+    investigating it read-only: pods, events, workloads, nodes, PromQL, the
+    nrp.ai documentation and the NRP accounting warehouse. It cannot exec,
+    port-forward, read Secrets, or write anything at all -- those are denied in
+    RBAC, not by prompting. Replies land in-thread with the finding, the
+    evidence, and the exact tool calls made, plus a usage chart when the shape
+    of the data is the answer.
 
 features:
   bot_user:
@@ -79,10 +81,22 @@ oauth_config:
       # `thread_history ok=false`; the bot still answers, just without context.
       - channels:history    # thread replies in public channels
       - groups:history      # thread replies in private channels
+      # Uploading usage charts. `files.upload` is the only write this scope
+      # buys and the agent makes exactly one call with it, in
+      # slack_app._upload_charts, with bytes it rendered itself -- it cannot
+      # forward a file from anywhere else, because nothing in the tool registry
+      # returns one.
+      #
+      # ALSO REQUIRES A REINSTALL, like the history scopes. Until the workspace
+      # re-authorizes, files_upload_v2 fails with `missing_scope`; the bot still
+      # posts the finding and audits `chart_upload ok=false`. Set
+      # NRP_OPS_CHARTS_ENABLED=false to stop it drawing them in the first place.
+      - files:write
 
 # Deliberately NOT requested: users:read, files:read. The agent authorizes on
-# user ID and never needs the directory. Adding either widens what a prompt
-# injection could reach.
+# user ID and never needs the directory. `files:write` is asked for above and
+# `files:read` deliberately is not -- the bot writes charts into a thread and
+# has no business reading files anyone else put there.
 
 settings:
   event_subscriptions:

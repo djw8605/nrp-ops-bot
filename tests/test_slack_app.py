@@ -11,6 +11,7 @@ import pytest
 from helpers import StubLoader
 from nrp_ops_agent.agent import AgentResult, ThreadMessage, ToolCallRecord
 from nrp_ops_agent.authz import Authorizer, SlackEvent, TokenBucket
+from nrp_ops_agent.charts import Chart
 from nrp_ops_agent.config import Allowlist, Settings
 from nrp_ops_agent.slack_app import ACK_TEXT, SlackOps, format_reply
 
@@ -20,13 +21,25 @@ CHANNEL = "C0OPSCHAN"
 
 
 class FakeSlackClient:
-    def __init__(self, replies: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        replies: list[dict[str, Any]] | None = None,
+        upload_error: Exception | None = None,
+    ) -> None:
         self.posted: list[dict[str, Any]] = []
         self.updated: list[dict[str, Any]] = []
         self.reactions: list[dict[str, Any]] = []
         self.replies_calls: list[dict[str, Any]] = []
+        self.uploads: list[dict[str, Any]] = []
         self._replies = replies or []
+        self._upload_error = upload_error
         self._ts = 0
+
+    async def files_upload_v2(self, **kwargs: Any) -> dict[str, Any]:
+        self.uploads.append(kwargs)
+        if self._upload_error is not None:
+            raise self._upload_error
+        return {"ok": True}
 
     async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
         self.replies_calls.append(kwargs)
@@ -391,3 +404,76 @@ class TestDmHandling:
         client = FakeSlackClient()
         await ops.handle(event(user="U0NOPE"), client)
         assert client.reactions[0]["name"] == emoji
+
+
+class TestChartUpload:
+    """Charts ride out of band, after the text and never instead of it."""
+
+    @staticmethod
+    def _chart(title: str = "GPU hours for coder") -> Chart:
+        return Chart(
+            filename="nrp-accounting-trend.png",
+            title=title,
+            alt_text="Daily GPU hours for namespace coder, 2026-07-01 to 2026-07-30.",
+            png=b"\x89PNG\r\n\x1a\nfake",
+        )
+
+    async def test_a_drawn_chart_is_uploaded_into_the_same_thread(self) -> None:
+        result = AgentResult(text="usage doubled", charts=[self._chart()])
+        ops, client = make_ops(result), FakeSlackClient()
+        await ops.handle(event(), client)
+
+        assert len(client.uploads) == 1
+        upload = client.uploads[0]
+        assert upload["channel"] == CHANNEL
+        assert upload["thread_ts"] == "1755000000.000100"
+        assert upload["file"].startswith(b"\x89PNG")
+
+    async def test_the_text_is_posted_before_the_upload(self) -> None:
+        # A workspace missing files:write must lose the picture, not the answer.
+        result = AgentResult(text="usage doubled", charts=[self._chart()])
+        ops, client = make_ops(result), FakeSlackClient()
+        await ops.handle(event(), client)
+        assert client.updated[-1]["text"].startswith("usage doubled")
+        assert client.uploads
+
+    async def test_an_upload_failure_does_not_lose_the_answer(
+        self, audit_stream: io.StringIO
+    ) -> None:
+        result = AgentResult(text="usage doubled", charts=[self._chart()])
+        ops = make_ops(result)
+        client = FakeSlackClient(upload_error=RuntimeError("missing_scope"))
+        assert await ops.handle(event(), client) is not None
+        assert client.updated[-1]["text"].startswith("usage doubled")
+
+        events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
+        failure = [e for e in events if e["event"] == "chart_upload"]
+        assert failure and failure[0]["ok"] is False
+
+    async def test_a_successful_upload_is_audited(self, audit_stream: io.StringIO) -> None:
+        result = AgentResult(text="usage doubled", charts=[self._chart()])
+        await make_ops(result).handle(event(), FakeSlackClient())
+        events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
+        uploads = [e for e in events if e["event"] == "chart_upload"]
+        assert uploads and uploads[0]["ok"] is True
+        assert uploads[0]["filename"] == "nrp-accounting-trend.png"
+
+    async def test_the_chart_title_passes_through_redaction(self) -> None:
+        # The pixels are scrubbed before rendering; the title rides beside the
+        # file as ordinary text and goes through the same chokepoint as a reply.
+        result = AgentResult(text="ok", charts=[self._chart("token AKIAIOSFODNN7EXAMPLE")])
+        ops, client = make_ops(result), FakeSlackClient()
+        await ops.handle(event(), client)
+        assert "AKIAIOSFODNN7EXAMPLE" not in client.uploads[0]["title"]
+
+    async def test_nothing_is_uploaded_when_no_chart_was_drawn(self) -> None:
+        ops, client = make_ops(AgentResult(text="all clear")), FakeSlackClient()
+        await ops.handle(event(), client)
+        assert client.uploads == []
+
+    async def test_the_chart_count_is_audited_on_the_reply(self, audit_stream: io.StringIO) -> None:
+        result = AgentResult(text="ok", charts=[self._chart(), self._chart()])
+        await make_ops(result).handle(event(), FakeSlackClient())
+        events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
+        reply = next(e for e in events if e["event"] == "reply_sent")
+        assert reply["charts"] == 2

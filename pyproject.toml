@@ -15,6 +15,9 @@ dependencies = [
     "kubernetes-asyncio>=31.1",
     "fastmcp>=2.0",
     "pyyaml>=6.0",
+    # Charts only. Imported lazily in nrp_ops_agent.charts, so a turn that
+    # draws nothing never pays the ~1s import.
+    "matplotlib>=3.9",
 ]
 
 [project.optional-dependencies]
@@ -78,7 +81,7 @@ mypy_path = "src"
 packages = ["nrp_ops_agent"]
 
 [[tool.mypy.overrides]]
-module = ["kubernetes_asyncio.*", "fastmcp.*", "slack_bolt.*", "slack_sdk.*"]
+module = ["kubernetes_asyncio.*", "fastmcp.*", "slack_bolt.*", "slack_sdk.*", "matplotlib.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

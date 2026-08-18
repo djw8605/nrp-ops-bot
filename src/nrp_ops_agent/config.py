@@ -129,6 +129,52 @@ class Settings(BaseSettings):
         default=200, ge=1, le=5000, description="Response series cap; excess is truncated."
     )
 
+    # ------------------------------------------------------------ Accounting --
+    # The read-only MCP server in front of the NRP accounting ClickHouse, from
+    # https://github.com/djw8605/nrp-clickhouse. It answers "who used what, and
+    # how much" over months, which Prometheus cannot: retention is short there,
+    # and its resource series describe requests rather than charged usage.
+    #
+    # This is the whole endpoint, not a base path to join onto: the server sets
+    # `streamable_http_path="/"`, so the MCP transport lives at the root and the
+    # OpenAPI bridge -- which this bot does not use -- lives under /openapi.
+    #
+    # Unauthenticated by design on the server side (only the mcpo/OpenAPI bridge
+    # carries an API key), so there is no credential here. What bounds the reach
+    # of this tool is tools/accounting.py naming five of the server's fourteen
+    # tools behind typed models, not the network.
+    accounting_mcp_url: str = Field(default="https://nrp-accounting-mcp.nrp-nautilus.io/")
+    accounting_timeout_s: float = Field(
+        default=20.0,
+        gt=0,
+        le=120,
+        description="Higher than Prometheus's: these are ClickHouse aggregations over "
+        "months of daily rows, not an instant vector read. Kept under the agent "
+        "loop's 30s per-dispatch cap so that a chart still has time to render "
+        "after its query returns -- raise both together or not at all.",
+    )
+    accounting_max_rows: int = Field(
+        default=500,
+        ge=1,
+        le=5000,
+        description="Rows kept from one accounting response; excess is truncated and "
+        "flagged. A group_by over two high-cardinality columns multiplies out.",
+    )
+
+    # ---------------------------------------------------------------- Charts --
+    charts_enabled: bool = Field(
+        default=True,
+        description="Render usage charts as PNGs and upload them to the thread. Needs "
+        "the Slack `files:write` scope; turn it off if the app was installed without.",
+    )
+    charts_max_per_turn: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Charts attached to one reply. A thread of six pictures is not an "
+        "answer, and each one is an upload the operator waits for.",
+    )
+
     # ------------------------------------------------------------------- LLM --
     # NRP's OpenAI-compatible gateway. NRP_OPS_LLM_MODEL has no default on purpose:
     # pointing at the wrong model silently is worse than failing to start, and the

@@ -10,7 +10,7 @@ and replies in-thread with a finding, cited evidence, and the exact tool calls i
 
 > **Status: Phase 1 complete.** Read-only Kubernetes tools, PromQL, the documentation index, the
 > playbooks, the tool-calling loop, the Slack listener, the deploy manifests and the eval harness
-> are all implemented and tested (371 tests, `ruff` and `mypy --strict` clean). Phase 2 — write
+> are all implemented and tested (541 tests, `ruff` and `mypy --strict` clean). Phase 2 — write
 > actions behind two-human approval — has **not** been started and needs explicit sign-off.
 >
 > The cluster-specific assumptions have since been checked against live Thanos, live
@@ -89,7 +89,7 @@ made.
 
 ## Tools
 
-Nine tools, all read-only. Out-of-range arguments are **rejected**, never silently clamped.
+Sixteen tools, all read-only. Out-of-range arguments are **rejected**, never silently clamped.
 
 | Tool | Notes |
 |---|---|
@@ -103,6 +103,12 @@ Nine tools, all read-only. Out-of-range arguments are **rejected**, never silent
 | `list_nodes(label_selector?, only_unhealthy=true)` | NRP has hundreds of nodes; healthy ones are never the answer |
 | `promql(query, lookback="1h", step?)` | omit `step` for instant, set it for range. Series and sample caps enforced |
 | `search_docs(query, limit=5, section="all")` | BM25 over the MDX index; every hit carries its `nrp.ai` URL |
+| `accounting_discover(dimension?, resource?, dates?, prefix?, limit=50)` | latest ingested date, plus the namespace / institution / node / GPU-model values actually observed |
+| `accounting_top(dimension, resource, dates?, filters?, limit=10)` | ranks namespaces, institutions, nodes or the commercial flag by one resource |
+| `accounting_trend(dimension, value, resource, dates?)` | daily usage for one namespace/institution/node; defaults to 30 days |
+| `accounting_usage(group_by=[…], filters?, limit=100)` | the escape hatch: any group-by and filter combination |
+| `accounting_llm_usage(group_by=[…], filters?, limit=100)` | LLM tokens by namespace, served model, alias and token type |
+| `accounting_chart(kind, resource, dimension?, …)` | queries **and** draws: `trend`, `ranking` or `breakdown`, attached to the reply as a PNG |
 
 Every returned object passes through `scrub_k8s_fields`, which drops `managedFields`, the
 `kubectl.kubernetes.io/last-applied-configuration` annotation, all `env`/`envFrom` and
@@ -111,6 +117,70 @@ summaries field by field rather than dumping objects, so the scrubber is a secon
 rather than the only one.
 
 There is no ConfigMap tool and no Secret tool, and `configmaps` is absent from the ClusterRole.
+
+## Accounting and charts
+
+"Who is burning the A100s", "how much did that namespace use last quarter" and "is our GPU
+demand still growing" are not cluster questions and Prometheus answers them badly: retention is
+short, and `kube_pod_container_resource_*` records what was *requested*, not what was charged.
+
+Those go to the accounting MCP server from
+[`djw8605/nrp-clickhouse`](https://github.com/djw8605/nrp-clickhouse), which serves daily
+per-namespace and per-pod usage rolled up from Prometheus and the NRP portal. In production that is
+`https://nrp-accounting-mcp.nrp-nautilus.io/` (`NRP_OPS_ACCOUNTING_MCP_URL`).
+
+- **The transport is one POST.** That server runs FastMCP stateless with JSON responses, so a call
+  needs no `initialize` handshake and no session — which is why
+  [`tools/accounting.py`](src/nrp_ops_agent/tools/accounting.py) speaks JSON-RPC directly instead
+  of adding an MCP client dependency. `Accept` must list **both** `application/json` and
+  `text/event-stream` or the transport answers 406 regardless of the server's response mode.
+- **Five of its fourteen tools are exposed**, each behind a pydantic model with closed literals for
+  resource and dimension. The endpoint is unauthenticated by design; what bounds this bot's reach
+  into it is the registry, not the network.
+- **Not gated on the namespace allowlist**, unlike the Kubernetes tools. That allowlist bounds what
+  can be read *out of* the cluster — logs, pod specs, events — where a bad namespace means someone
+  else's credential in a log line. Accounting rows are aggregates that already leave NRP for XDMoD,
+  and "top ten GPU consumers" is cluster-wide by construction: an allowlist would answer it wrongly
+  rather than refusing it.
+- **Results are flagged untrusted.** Namespace, node and PI names are user-chosen, so
+  `accounting_*` output is wrapped like any other tool output.
+
+### Charts
+
+`accounting_chart` runs the query itself, renders a PNG, and returns the numbers it plotted.
+Call it *instead of* the matching query tool, not after it.
+
+| `kind` | Form | Answers |
+|---|---|---|
+| `trend` | line with a 10% wash, end-labelled | "when did their GPU usage jump?" |
+| `ranking` | horizontal bars, largest first, value at each tip | "who are the top consumers?" |
+| `breakdown` | stacked areas, tail folded into *Other* | "how does the total split, and is that shifting?" |
+
+The image travels **out of band**: a context-local collector in
+[`charts.py`](src/nrp_ops_agent/charts.py) carries it from the tool to `AgentResult.charts`, and
+`slack_app._upload_charts` posts it into the thread after the text. Image bytes never enter the
+model's context — it sees only the numbers, and the prompt tells it to write the finding from those
+and never to describe a picture it cannot see.
+
+Three things follow from a PNG being unscrubbable:
+
+1. **Labels are redacted before they are drawn.** `redact.py` cannot reach rasterised text, so
+   `charts.clean_label` runs on every namespace name, date and title on the way *into* matplotlib.
+   The title and alt text that ride beside the file go through the outbound chokepoint as well.
+2. **The upload cannot cost the answer.** It happens after `chat.update`, and a failure — a
+   workspace installed without `files:write`, most likely — is audited as `chart_upload ok=false`
+   and otherwise swallowed. Set `NRP_OPS_CHARTS_ENABLED=false` to stop drawing them entirely.
+3. **Two charts per reply** (`NRP_OPS_CHARTS_MAX_PER_TURN`). Past the budget the tool *refuses*
+   rather than silently dropping, so the model never promises a picture that will not appear.
+
+Style is one validated palette across every chart, so two in a thread read as one system: six
+categorical hues assigned by slot and never cycled (worst adjacent pair 9.1 ΔE under simulated
+colour-vision deficiency, 19.6 unsimulated), one blue for rankings because length already carries
+magnitude, a legend whenever there is more than one series, and one number format per chart chosen
+from its peak — `184.3k` above `9.1k`, never `15.8k` above `9,120`.
+
+`nrp-ops-ask` writes any charts it drew to `--charts-dir` (default `./charts`) so they can be
+looked at from a terminal.
 
 ## Documentation index
 
@@ -189,6 +259,11 @@ endpoint, credential, namespace or Slack ID is hardcoded anywhere else in the pa
 | `NRP_OPS_PROMETHEUS_BASE_URL` | `https://thanos.nrp-nautilus.io` | or `https://prometheus.nrp-nautilus.io` |
 | `NRP_OPS_PROMETHEUS_BEARER_TOKEN` | — | verified unauthenticated; leave unset |
 | `NRP_OPS_PROMETHEUS_TIMEOUT_S` / `_MAX_SERIES` | `10` / `200` | |
+| `NRP_OPS_ACCOUNTING_MCP_URL` | `https://nrp-accounting-mcp.nrp-nautilus.io/` | whole endpoint, not a base path; empty disables the tools |
+| `NRP_OPS_ACCOUNTING_TIMEOUT_S` | `20` | kept under the loop's 30s dispatch cap so a chart still has time to render |
+| `NRP_OPS_ACCOUNTING_MAX_ROWS` | `500` | rows kept per response; excess truncated and flagged |
+| `NRP_OPS_CHARTS_ENABLED` | `true` | needs the Slack `files:write` scope |
+| `NRP_OPS_CHARTS_MAX_PER_TURN` | `2` | past this the chart tool refuses rather than dropping |
 | `NRP_OPS_LLM_BASE_URL` | `https://ellm.nrp-nautilus.io/v1` | `/v1` verified; POST needs a key |
 | `NRP_OPS_LLM_API_KEY` / `_MODEL` | — | `_MODEL` has no default on purpose |
 | `NRP_OPS_LLM_TEMPERATURE` / `_MAX_TOKENS` | `0.0` / `2048` | |
@@ -293,7 +368,13 @@ One JSON object per line on stdout. Stable keys; absent fields are omitted rathe
 | `ok` | bool | outcome-bearing events |
 
 `event` is one of `startup`, `policy_reload`, `authz_allow`, `authz_deny`, `model_call`,
-`model_error`, `tool_call`, `tool_error`, `redaction_hit`, `thread_history`, `reply_sent`.
+`model_error`, `tool_call`, `tool_error`, `redaction_hit`, `thread_history`, `chart_upload`,
+`reply_sent`.
+
+`chart_upload` records one attempted image upload (`filename`, plus `result_bytes` on success).
+`ok: false` there is almost always a workspace installed without `files:write`; the reply itself
+was already posted, so this is the only place that failure shows up. `reply_sent` carries a
+`charts` count alongside `tool_calls` and `iterations`.
 
 `thread_history` records how much prior conversation was read for a turn (`messages`, and
 `untrusted` for the count written by non-operators). `ok: false` on it means the read failed —
@@ -333,8 +414,8 @@ tokens go into the sealed Secret; the Deployment consumes them via `envFrom`.
 
 Doing it by hand instead: *From scratch*, then Socket Mode → enable and generate the app token;
 **OAuth & Permissions** → bot scopes `app_mentions:read`, `chat:write`, `im:history`,
-`reactions:write`, `channels:history`, `groups:history` and nothing more; **Event Subscriptions** →
-bot events `app_mention` and `message.im`; install to the workspace.
+`reactions:write`, `channels:history`, `groups:history`, `files:write` and nothing more;
+**Event Subscriptions** → bot events `app_mention` and `message.im`; install to the workspace.
 
 ### Thread context needs a reinstall
 
@@ -352,13 +433,20 @@ channels, the failure is audited as `thread_history` with `ok: false`, and the t
 without context — exactly the behaviour that made threads feel forgetful in the first place. Threads
 in DMs gain context immediately, since `im:history` is already held.
 
+`files:write` is in the same boat and fails the same way. Without it `files_upload_v2` raises
+`missing_scope`, the failure is audited as `chart_upload` with `ok: false`, and the reply — already
+posted — stands without its chart. Reinstall to grant it, or set `NRP_OPS_CHARTS_ENABLED=false` so
+the agent stops drawing charts it cannot deliver.
+
 Non-operators can reply inside a thread an operator started. Their messages are included as context
 but wrapped in `<untrusted_thread_message>`, the same envelope used for pod logs, so they read as
 data and never as instructions — the operator-only boundary in `authz.py` is not weakened by
 reading the thread. Set `NRP_OPS_SLACK_THREAD_HISTORY_LIMIT=0` to turn thread reading off entirely.
 
-Not requested, deliberately: `channels:history`, `groups:history`, `users:read`, `files:read`. The
-agent authorizes on user ID and does not need the directory.
+Not requested, deliberately: `users:read`, `channels:read`, `files:read`. The agent authorizes on
+user ID and does not need the directory, and it uploads charts rather than reading anyone else's
+files. (`channels:history` and `groups:history` *are* requested — see above; this line predated
+thread reading and named them by mistake.)
 
 ### Replies are converted to Slack mrkdwn
 
@@ -710,7 +798,7 @@ kubectl auth can-i list pods --as=system:serviceaccount:system-nrp-ops-bot:nrp-o
 
 ## Evals
 
-`evals/cases.yaml` holds 20 operator questions with expected namespaces, workloads, findings and
+`evals/cases.yaml` holds 24 operator questions with expected namespaces, workloads, findings and
 tool sets. `run_evals.py` scores each run on namespace accuracy, workload identification, finding
 match and tool selection, and reports mean tool count and latency.
 
@@ -729,11 +817,15 @@ them with real outages as they happen; that is what makes the suite worth runnin
 
 ## MCP server
 
-`python -m nrp_ops_agent.mcp_server` exposes the same nine tools over MCP. It is a second *front
+`python -m nrp_ops_agent.mcp_server` exposes the same sixteen tools over MCP. It is a second *front
 end*, not a second tool surface: every call goes through the same dispatcher, so validation, the
 namespace allowlist, redaction and the audit trail all apply, and the advertised schemas are
 generated from the same pydantic models. MCP clients bypass the Slack authorization gate, so only
 expose it to people already trusted with cluster read access.
+
+Note that an MCP client has nowhere to put an image, so `accounting_chart` returns its numbers with
+`attached: false` there rather than failing — the collector is installed by the agent loop, and
+`charts.emit` reports that there is none.
 
 ## Development
 
@@ -748,7 +840,7 @@ uv run mypy
 ```
 
 Stack: Python 3.12, `slack-bolt` (Socket Mode), `kubernetes-asyncio`, `fastmcp`, `httpx`,
-`pydantic` v2, SQLite FTS5 for the docs index. No agent framework — the tool-calling loop is
+`pydantic` v2, SQLite FTS5 for the docs index, `matplotlib` (Agg) for charts. No agent framework — the tool-calling loop is
 hand-rolled against the OpenAI-compatible chat completions API so that it stays auditable.
 
 ## Build order

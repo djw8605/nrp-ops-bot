@@ -1,9 +1,13 @@
 """Slack listener (Socket Mode).
 
 Security role: the outbound redaction chokepoint lives here --
-:func:`_post` and :func:`_update` are the only places this process writes to
-Slack, and both scrub first. Nothing else in the package may call
-``chat.postMessage`` directly.
+:func:`_post`, :func:`_update` and :func:`_upload_charts` are the only places
+this process writes to Slack, and all of them scrub first. Nothing else in the
+package may call ``chat.postMessage`` or ``files.upload`` directly.
+
+A chart's *pixels* cannot be scrubbed here, which is why
+:mod:`nrp_ops_agent.charts` redacts every label before it is drawn. What this
+module scrubs on an upload is the title and alt text that ride beside the file.
 
 Socket Mode means there is no public ingress, no request-signature endpoint and
 no inbound network path to this pod at all; egress is restricted by
@@ -21,7 +25,7 @@ import os
 import sys
 from typing import Any
 
-from nrp_ops_agent import audit
+from nrp_ops_agent import audit, charts
 from nrp_ops_agent.agent import Agent, AgentResult, ThreadMessage
 from nrp_ops_agent.authz import Authorizer, SlackEvent
 from nrp_ops_agent.config import AllowlistLoader, Settings, get_allowlist_loader, get_settings
@@ -76,6 +80,54 @@ class SlackOps:
         if rules:
             audit.emit("redaction_hit", slack_channel=channel, redaction_rules=rules)
         await client.chat_update(channel=channel, ts=ts, text=fit(clean, MAX_MESSAGE_CHARS))
+
+    async def _upload_charts(
+        self, client: Any, *, channel: str, thread_ts: str, drawn: list[charts.Chart]
+    ) -> None:
+        """Attach rendered charts under the reply. Never fatal.
+
+        Uploads happen after the text is posted, so the finding is already in
+        the thread when this runs: a workspace that installed the app without
+        `files:write` loses the picture and keeps the answer, which is the right
+        way round. The failure is audited rather than raised for the same
+        reason -- an operator reading `chart_upload ok=false` can fix the scope,
+        while an exception here would have cost them the diagnosis too.
+        """
+        for chart in drawn:
+            title, rules = redact(chart.title)
+            alt, alt_rules = redact(chart.alt_text)
+            if rules or alt_rules:
+                audit.emit(
+                    "redaction_hit", slack_channel=channel, redaction_rules=rules + alt_rules
+                )
+            try:
+                await client.files_upload_v2(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    file=chart.png,
+                    filename=chart.filename,
+                    title=fit(title, 250),
+                    alt_text=fit(alt, 1000),
+                )
+            except Exception as exc:
+                log.warning("chart upload failed: %s", exc)
+                audit.emit(
+                    "chart_upload",
+                    slack_channel=channel,
+                    thread_ts=thread_ts,
+                    ok=False,
+                    reason=type(exc).__name__,
+                    extra={"filename": chart.filename, "detail": str(exc)[:200]},
+                )
+                continue
+            audit.emit(
+                "chart_upload",
+                slack_channel=channel,
+                thread_ts=thread_ts,
+                ok=True,
+                result_bytes=chart.size_bytes,
+                extra={"filename": chart.filename},
+            )
 
     async def _react(self, client: Any, *, channel: str, ts: str) -> None:
         try:
@@ -208,6 +260,14 @@ class SlackOps:
                     client, channel=event.channel, thread_ts=event.reply_thread_ts, text=reply
                 )
 
+            if result.charts:
+                await self._upload_charts(
+                    client,
+                    channel=event.channel,
+                    thread_ts=event.reply_thread_ts,
+                    drawn=result.charts,
+                )
+
             audit.emit(
                 "reply_sent",
                 slack_user=event.user,
@@ -217,7 +277,11 @@ class SlackOps:
                 ok=result.ok,
                 reason=result.stop_reason,
                 result_bytes=len(reply.encode("utf-8")),
-                extra={"tool_calls": len(result.tool_calls), "iterations": result.iterations},
+                extra={
+                    "tool_calls": len(result.tool_calls),
+                    "iterations": result.iterations,
+                    "charts": len(result.charts),
+                },
             )
             return result
 

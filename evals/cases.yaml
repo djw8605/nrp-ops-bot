@@ -204,3 +204,54 @@ cases:
       No service keyword, so the default playbook applies. Pass means it either
       narrows the question or checks cluster-wide health -- not that it invents a
       namespace.
+
+  # Accounting. These do not touch the cluster at all: a run that reaches for
+  # promql here has misread the question, which is why it is forbidden rather
+  # than merely unexpected -- Thanos will answer *something* about GPU requests
+  # and it will not be the charged usage anyone asked for.
+  - id: accounting-top-gpu
+    question: "who were the top GPU users last month?"
+    namespace: null
+    workload: null
+    expect_tools: [accounting_top]
+    forbid_tools: [promql]
+    finding_keywords: ["gpu"]
+    notes: >-
+      A ranking question. accounting_chart with kind=ranking is an equally good
+      answer -- both call top_resource_consumers underneath -- so score the
+      finding, not which of the two it picked.
+
+  - id: accounting-a100
+    question: "which namespaces are using the A100s?"
+    namespace: null
+    workload: null
+    expect_tools: [accounting_top]
+    forbid_tools: []
+    finding_keywords: ["a100"]
+    notes: >-
+      Needs gpu_model_regex, not resource='a100'. Pass means the answer names
+      namespaces; a run that lists GPU models has answered a different question.
+
+  - id: accounting-trend-chart
+    question: "chart coder's GPU hours over the last 60 days"
+    namespace: coder
+    workload: null
+    expect_tools: [accounting_chart]
+    forbid_tools: [promql]
+    finding_keywords: ["gpu"]
+    notes: >-
+      An explicit request for a picture. Pass means one chart, and an answer
+      that states the numbers rather than describing the image it cannot see.
+
+  - id: accounting-latest-date
+    question: "how much GPU time did braingeneers use today?"
+    namespace: braingeneers
+    workload: null
+    expect_tools: [accounting_discover]
+    forbid_tools: []
+    finding_keywords: []
+    notes: >-
+      Accounting lags real time, so "today" usually has no data. Pass means the
+      answer names the most recent ingested date instead of silently reporting
+      that day as zero.
+

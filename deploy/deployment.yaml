@@ -81,6 +81,14 @@ spec:
               value: incluster
             - name: NRP_OPS_PROMETHEUS_BASE_URL
               value: https://thanos.nrp-nautilus.io
+            # The read-only accounting MCP server from djw8605/nrp-clickhouse.
+            # The whole endpoint, not a base path: that server mounts the MCP
+            # transport at "/" and the (unused) OpenAPI bridge under /openapi.
+            # No credential -- it is unauthenticated by design, and what bounds
+            # this bot's reach into it is the five typed tools in
+            # tools/accounting.py, not the network.
+            - name: NRP_OPS_ACCOUNTING_MCP_URL
+              value: https://nrp-accounting-mcp.nrp-nautilus.io/
             - name: NRP_OPS_LLM_BASE_URL
               value: https://ellm.nrp-nautilus.io/v1
             # Verified to emit OpenAI-style tool_calls, which the loop depends

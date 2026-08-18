@@ -148,7 +148,7 @@ def _load_builtin_tools() -> None:
     if _loaded:
         return
     _loaded = True
-    from nrp_ops_agent.tools import docs, k8s, prometheus  # noqa: F401
+    from nrp_ops_agent.tools import accounting, docs, k8s, prometheus  # noqa: F401
 
 
 async def dispatch(
