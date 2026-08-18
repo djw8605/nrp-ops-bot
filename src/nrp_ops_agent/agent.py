@@ -84,6 +84,14 @@ class ThreadMessage:
 
 
 @dataclass(frozen=True)
+class _Memo:
+    """One thread's carried tool exchange, and when it was recorded."""
+
+    at: float
+    messages: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
 class ToolCallRecord:
     """One executed tool call, for the audit trail and the Slack tool trace."""
 
@@ -130,6 +138,12 @@ class Agent:
     ) -> None:
         self._settings = settings or get_settings()
         self._client = client
+        #: Last turn's tool exchange per Slack thread, so a follow-up can read
+        #: what was already fetched instead of fetching it again. In-process and
+        #: deliberately not persisted: the Deployment runs one replica (Socket
+        #: Mode holds one connection), a restart losing it costs one re-query,
+        #: and a thread's results have no business outliving the pod.
+        self._memos: dict[str, _Memo] = {}
 
     # -------------------------------------------------------------- plumbing --
 
@@ -203,9 +217,18 @@ class Agent:
                 extra={
                     "prompt_tokens": usage.get("prompt_tokens"),
                     "completion_tokens": usage.get("completion_tokens"),
+                    # Audited because 'length' here is the difference between an
+                    # answer and half of one, and reading it off a token count
+                    # that happens to equal max_tokens is guesswork.
+                    "finish_reason": choices[0].get("finish_reason"),
                 },
             )
-            message: dict[str, Any] = choices[0].get("message") or {}
+            message: dict[str, Any] = dict(choices[0].get("message") or {})
+            # ``finish_reason`` rides on the choice, not on the message, and the
+            # loop cannot tell a finished answer from one cut off at max_tokens
+            # without it. Folded in here so callers hold one object; every other
+            # key is the endpoint's own.
+            message["finish_reason"] = str(choices[0].get("finish_reason") or "")
             return message
 
         audit.emit(
@@ -225,6 +248,7 @@ class Agent:
         *,
         history: Sequence[ThreadMessage] | None = None,
         progress: ProgressFn | None = None,
+        thread_key: str | None = None,
     ) -> AgentResult:
         """One investigation, with any charts it drew attached to the result.
 
@@ -234,7 +258,9 @@ class Agent:
         drawn before it.
         """
         with charts.collecting(self._settings.charts_max_per_turn) as collector:
-            result = await self._run(message, history=history, progress=progress)
+            result = await self._run(
+                message, history=history, progress=progress, thread_key=thread_key
+            )
         result.charts = list(collector.charts)
         return result
 
@@ -244,6 +270,7 @@ class Agent:
         *,
         history: Sequence[ThreadMessage] | None = None,
         progress: ProgressFn | None = None,
+        thread_key: str | None = None,
     ) -> AgentResult:
         settings = self._settings
         deadline = time.monotonic() + settings.agent_wall_clock_timeout_s
@@ -259,10 +286,46 @@ class Agent:
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         messages.extend(m.render() for m in history)
+        # Carried results sit next to the question they are being asked about,
+        # for the same reason the history budget keeps the newest turns: what
+        # resolves "continue" is the turn immediately before it.
+        carried = self._recall(thread_key)
+        if carried:
+            messages.append(
+                self._system_note(
+                    "The tool results below are from your previous turn in this thread, "
+                    "replayed so a follow-up need not re-run them. They may be stale: "
+                    "re-run a tool if the answer turns on what is true right now."
+                )
+            )
+            messages.extend(carried)
         messages.append({"role": "user", "content": wrap_operator_message(message)})
 
+        try:
+            return await self._loop(messages, progress=progress, deadline=deadline)
+        finally:
+            # Every exit -- answered, truncated, timed out, raised -- leaves the
+            # thread its results. A follow-up should never re-fetch what the turn
+            # it is following up on already had.
+            self._remember(thread_key, messages)
+
+    async def _loop(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        progress: ProgressFn | None,
+        deadline: float,
+    ) -> AgentResult:
+        """Model call, tool calls, repeat -- until an answer or a budget stops it.
+
+        Takes ``messages`` by reference and appends to it: the caller owns the
+        conversation, which is what lets it carry the tool exchange forward
+        without this loop knowing anything about threads.
+        """
+        settings = self._settings
         result = AgentResult(text="")
         calls_made = 0
+        retries = 0
 
         for iteration in range(1, settings.agent_max_iterations + 1):
             result.iterations = iteration
@@ -287,9 +350,51 @@ class Agent:
 
             tool_calls = reply.get("tool_calls") or []
             content = (reply.get("content") or "").strip()
+            truncated = str(reply.get("finish_reason") or "") == "length"
 
             if not tool_calls:
-                result.text = content or self._partial(result, "produced no answer")
+                if truncated and retries < settings.agent_max_truncation_retries:
+                    # Cut off at max_tokens. Nothing has been posted yet -- the
+                    # ack is edited only once the turn ends -- so the half answer
+                    # is discarded and asked for again, short enough to finish.
+                    # Discarded rather than continued: stitching a second
+                    # generation onto a sentence that stopped mid-word produces a
+                    # seam no operator should have to read around.
+                    retries += 1
+                    audit.emit(
+                        "model_truncated",
+                        model=settings.llm_model,
+                        ok=False,
+                        reason="length",
+                        extra={"attempt": retries, "wrote_chars": len(content)},
+                    )
+                    messages.append(
+                        self._system_note(
+                            "Your previous reply hit the output token limit and was cut off "
+                            "before it was finished, so it has been discarded. Write the "
+                            "finding again and keep it inside the limit: lead with the "
+                            "conclusion in one or two sentences, then the evidence for it. "
+                            "You already have the tool results you need; do not call more "
+                            "tools unless something is genuinely missing."
+                        )
+                    )
+                    continue
+                if truncated:
+                    # Out of retries. Report what was written and mark it, rather
+                    # than passing half a finding off as a whole one.
+                    result.stop_reason = "truncated"
+                    result.text = content or self._partial(
+                        result, "spent the whole output budget before writing an answer"
+                    )
+                    return result
+                if not content:
+                    # A reasoning model can return an empty ``content`` with its
+                    # whole turn in ``reasoning_content``. That is a fault, and
+                    # calling it "answered" is what hid it.
+                    result.stop_reason = "empty_answer"
+                    result.text = self._partial(result, "produced no answer")
+                    return result
+                result.text = content
                 result.stop_reason = "answered"
                 return result
 
@@ -395,6 +500,65 @@ class Agent:
     @staticmethod
     def _system_note(text: str) -> dict[str, Any]:
         return {"role": "system", "content": text}
+
+    # ---------------------------------------------------------- thread memo --
+
+    def _recall(self, thread_key: str | None) -> list[dict[str, Any]]:
+        """The previous turn's tool exchange for this thread, if still fresh."""
+        settings = self._settings
+        if not thread_key or settings.agent_thread_memo_char_budget <= 0:
+            return []
+        memo = self._memos.get(thread_key)
+        if memo is None:
+            return []
+        if time.monotonic() - memo.at > settings.agent_thread_memo_ttl_s:
+            # Cluster state moves. Replaying an hour-old pod list as if it were
+            # current is worse than making the model look again.
+            del self._memos[thread_key]
+            return []
+        return [dict(m) for m in memo.messages]
+
+    def _remember(self, thread_key: str | None, messages: list[dict[str, Any]]) -> None:
+        """Keep this turn's tool exchange for the next question in the thread.
+
+        Kept in whole assistant-plus-results blocks, newest first, until the
+        character budget is spent. Whole blocks because a ``tool`` message whose
+        ``tool_call_id`` has no matching assistant ``tool_calls`` in the same
+        request is not merely confusing -- the endpoint rejects it.
+        """
+        settings = self._settings
+        if not thread_key or settings.agent_thread_memo_char_budget <= 0:
+            return
+
+        blocks: list[list[dict[str, Any]]] = []
+        for message in messages:
+            role = message.get("role")
+            if role == "assistant" and message.get("tool_calls"):
+                blocks.append([message])
+            elif role == "tool" and blocks:
+                blocks[-1].append(message)
+
+        kept: list[dict[str, Any]] = []
+        spent = 0
+        for block in reversed(blocks):
+            size = sum(len(str(m.get("content") or "")) for m in block)
+            if kept and spent + size > settings.agent_thread_memo_char_budget:
+                break
+            kept = [*block, *kept]
+            spent += size
+
+        if not kept:
+            self._memos.pop(thread_key, None)
+            return
+        self._memos[thread_key] = _Memo(at=time.monotonic(), messages=tuple(kept))
+
+        # A cache in a process that runs for weeks needs a lid. Oldest out
+        # first: the thread nobody has touched is the one least likely to get a
+        # follow-up.
+        excess = len(self._memos) - settings.agent_thread_memo_max_threads
+        if excess > 0:
+            for stale in sorted(self._memos, key=lambda key: self._memos[key].at)[:excess]:
+                del self._memos[stale]
 
     @staticmethod
     def _progress_line(calls: list[dict[str, Any]]) -> str:

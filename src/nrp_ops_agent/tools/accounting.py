@@ -106,6 +106,25 @@ ListDimension = Literal[
 
 LlmDimension = Literal["date", "namespace", "token_alias", "model", "token_type"]
 
+#: What a chart can split its bars or bands by. The rank dimensions plus the
+#: three that exist only in the LLM token table -- "plot the most used models by
+#: day" is a normal question, and refusing `dimension='model'` here left it with
+#: no answerable form at all.
+ChartDimension = Literal[
+    "namespace",
+    "institution",
+    "node",
+    "commercial",
+    "model",
+    "token_alias",
+    "token_type",
+]
+
+#: Dimensions held only by ``query_llm_token_usage``. A chart split by one of
+#: these is fetched from that table instead of the resource usage tables, which
+#: have no such column and would silently return rows that plot as zero.
+_LLM_ONLY_DIMENSIONS: Final = frozenset({"model", "token_alias", "token_type"})
+
 #: What a group-by defaults to when the model gives none. Namespace is the
 #: dimension every accounting question is eventually about.
 _DEFAULT_GROUP_BY: Final[list[GroupDimension]] = ["namespace"]
@@ -290,6 +309,18 @@ def _number(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _usage(row: Mapping[str, Any]) -> float:
+    """The measured value of a row, whichever column its table calls it.
+
+    ``query_resource_usage`` and ``top_resource_consumers`` report ``usage``;
+    ``query_llm_token_usage`` reports ``tokens_used`` and no ``usage`` at all.
+    Reading both here keeps every chart builder out of the business of knowing
+    which table it was handed.
+    """
+    value = row.get("usage")
+    return _number(value if value is not None else row.get("tokens_used"))
 
 
 # --------------------------------------------------------------------------- #
@@ -573,10 +604,12 @@ class ChartArgs(BaseModel):
         "dimension over time.",
     )
     resource: Resource
-    dimension: RankDimension | None = Field(
+    dimension: ChartDimension | None = Field(
         default=None,
         description="Required for 'ranking' and 'breakdown': what the bars or bands "
-        "are. For 'trend' it names what `value` refers to.",
+        "are. For 'trend' it names what `value` refers to. 'model', 'token_alias' "
+        "and 'token_type' come from the LLM token accounting, so they need "
+        "resource='llm' and work with 'ranking' and 'breakdown' only.",
     )
     value: Name | None = Field(
         default=None,
@@ -630,6 +663,8 @@ async def accounting_chart(args: ChartArgs) -> dict[str, Any]:
             "is the per-answer limit. Query the numbers instead and describe them.",
         )
 
+    _check_chart_dimension(args)
+
     if args.kind == "trend":
         return await _chart_trend(args)
     if args.kind == "ranking":
@@ -647,6 +682,56 @@ def _window(payload: Mapping[str, Any]) -> str:
 
 def _footer() -> str:
     return "NRP accounting · daily aggregates from ClickHouse"
+
+
+def _chart_unit(args: ChartArgs, rows: list[dict[str, Any]]) -> str:
+    """The axis label for a chart's rows.
+
+    LLM rows carry no ``unit`` column in either table, which would otherwise
+    label a token count "usage". They are tokens in both.
+    """
+    unit = _unit_label(str(rows[0].get("unit") or ""))
+    if unit == "usage" and args.resource == "llm":
+        return "tokens"
+    return unit
+
+
+def _check_chart_dimension(args: ChartArgs) -> None:
+    """Refuse a dimension the table behind the chart cannot split by.
+
+    Refused rather than coerced: the alternative to an error the model can read
+    and correct is a chart that looks right and plots the wrong thing.
+    """
+    if args.dimension not in _LLM_ONLY_DIMENSIONS:
+        return
+    if args.resource != "llm":
+        raise ToolError(
+            "invalid_arguments",
+            f"dimension={args.dimension!r} exists only in the LLM token accounting. "
+            "Pass resource='llm', or pick a dimension the "
+            f"{args.resource} tables hold: namespace, institution, node, commercial.",
+        )
+    if args.kind == "trend":
+        raise ToolError(
+            "invalid_arguments",
+            f"kind='trend' plots one line and cannot split by {args.dimension!r}. Use "
+            "kind='breakdown' for it by day, or kind='ranking' for the totals.",
+        )
+    ignored = [
+        name
+        for name, value in (
+            ("institution", args.institution),
+            ("node_regex", args.node_regex),
+            ("gpu_model_regex", args.gpu_model_regex),
+        )
+        if value is not None
+    ]
+    if ignored:
+        raise ToolError(
+            "invalid_arguments",
+            f"The LLM token accounting has no {', '.join(ignored)} column, so that "
+            "filter cannot be applied. Drop it, or filter by namespace instead.",
+        )
 
 
 #: Matches the server's own trend default, so a chart drawn through
@@ -701,6 +786,7 @@ def _result(
     unit: str,
     window: str,
     plotted: list[dict[str, Any]],
+    window_requested: str | None = None,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {
         "chart": kind,
@@ -710,6 +796,8 @@ def _result(
         "attached": attached,
         "plotted": plotted,
     }
+    if window_requested:
+        out["window_requested"] = window_requested
     if attached:
         out["note"] = (
             "The chart is attached to your reply as an image. Do not describe the "
@@ -719,6 +807,15 @@ def _result(
         out["note"] = (
             "The chart could NOT be attached, so the operator will see only your text. "
             "Give the numbers above in full and do not refer to a chart."
+        )
+    if window_requested:
+        # The operator asked about a longer period than this answers. Saying so
+        # is the whole point: a shorter chart under a longer question reads as a
+        # complete answer to it.
+        out["note"] += (
+            f" Only {window} came back within the row limit, not the {window_requested} "
+            "you asked for -- say so, and narrow the window or the dimension to cover "
+            "the rest."
         )
     return out
 
@@ -771,9 +868,9 @@ async def _chart_trend(args: ChartArgs) -> dict[str, Any]:
             "note": "No accounting rows matched, so nothing was drawn. Say there is no data.",
         }
 
-    unit = _unit_label(str(rows[0].get("unit") or ""))
+    unit = _chart_unit(args, rows)
     x_labels = [charts.clean_label(row.get("date")) for row in rows]
-    values = tuple(_number(row.get("usage")) for row in rows)
+    values = tuple(_usage(row) for row in rows)
     window = _window(payload)
 
     title = args.title or f"{unit} for {subject}"
@@ -811,25 +908,73 @@ async def _chart_trend(args: ChartArgs) -> dict[str, Any]:
     )
 
 
+#: Rows one day of a breakdown is expected to need. A daily breakdown returns
+#: one row per day per dimension value and the row cap is a *total*, so a cap
+#: sized for a ranking answers a quarter-long question with its last six weeks.
+#: 25 covers every dimension charted here (the gateway serves ~14 models) with
+#: room to grow before the fold-into-Other tail is reached.
+_BREAKDOWN_ROWS_PER_DAY: Final = 25
+
+#: Hard ceiling on that sizing, matching the row cap's own upper bound.
+_BREAKDOWN_MAX_ROWS: Final = 5000
+
+
+def _breakdown_limit(start_date: str | None, end_date: str | None) -> int:
+    """Rows to ask for so the window is covered, not merely started."""
+    floor = get_settings().accounting_max_rows
+    try:
+        days = (date.fromisoformat(str(end_date)) - date.fromisoformat(str(start_date))).days + 1
+    except ValueError:
+        return floor
+    return max(floor, min(_BREAKDOWN_MAX_ROWS, days * _BREAKDOWN_ROWS_PER_DAY))
+
+
+async def _llm_rows(args: ChartArgs, group_by: list[str], limit: int) -> dict[str, Any]:
+    """Fetch a chart's rows from the LLM token table.
+
+    Only the columns that table actually has are sent: it is keyed by date,
+    namespace, model, token alias and token type, and knows nothing about nodes
+    or GPU models. ``_check_chart_dimension`` has already refused the filters
+    that would have been dropped here.
+    """
+    return await call_mcp(
+        "query_llm_token_usage",
+        {
+            "group_by": group_by,
+            "start_date": args.start_date,
+            "end_date": args.end_date,
+            "namespace": args.namespace,
+            "limit": limit,
+        },
+    )
+
+
 async def _chart_ranking(args: ChartArgs) -> dict[str, Any]:
     if args.dimension is None:
         raise ToolError(
             "invalid_arguments", "kind='ranking' needs `dimension` -- what is being ranked."
         )
-    payload = await call_mcp(
-        "top_resource_consumers",
-        {
-            "dimension": args.dimension,
-            "resource": args.resource,
-            "start_date": args.start_date,
-            "end_date": args.end_date,
-            "institution": args.institution,
-            "node_regex": args.node_regex,
-            "gpu_model_regex": args.gpu_model_regex,
-            "limit": min(args.top_n, charts.MAX_BARS),
-        },
-    )
-    rows = _rows(payload)
+    limit = min(args.top_n, charts.MAX_BARS)
+    if args.dimension in _LLM_ONLY_DIMENSIONS:
+        payload = await _llm_rows(args, [args.dimension], limit)
+        # top_resource_consumers ranks server-side; the token table returns rows
+        # in its own order, so a ranking has to be ranked here.
+        rows = sorted(_rows(payload), key=_usage, reverse=True)[:limit]
+    else:
+        payload = await call_mcp(
+            "top_resource_consumers",
+            {
+                "dimension": args.dimension,
+                "resource": args.resource,
+                "start_date": args.start_date,
+                "end_date": args.end_date,
+                "institution": args.institution,
+                "node_regex": args.node_regex,
+                "gpu_model_regex": args.gpu_model_regex,
+                "limit": limit,
+            },
+        )
+        rows = _rows(payload)
     if not rows:
         return {
             "chart": "ranking",
@@ -839,9 +984,9 @@ async def _chart_ranking(args: ChartArgs) -> dict[str, Any]:
             "note": "No accounting rows matched, so nothing was drawn. Say there is no data.",
         }
 
-    unit = _unit_label(str(rows[0].get("unit") or ""))
+    unit = _chart_unit(args, rows)
     labels = [charts.clean_label(row.get(args.dimension)) for row in rows]
-    values = [_number(row.get("usage")) for row in rows]
+    values = [_usage(row) for row in rows]
     window = _window(payload)
 
     title = args.title or f"Top {args.dimension}s by {unit}"
@@ -882,20 +1027,28 @@ async def _chart_breakdown(args: ChartArgs) -> dict[str, Any]:
             "kind='breakdown' needs `dimension` -- what the stacked bands are.",
         )
     start_date, end_date = await _trend_window(args.start_date, args.end_date)
-    payload = await call_mcp(
-        "query_resource_usage",
-        {
-            "group_by": ["date", args.dimension, "unit"],
-            "resource": args.resource,
-            "start_date": start_date,
-            "end_date": end_date,
-            "namespace": args.namespace,
-            "institution": args.institution,
-            "node_regex": args.node_regex,
-            "gpu_model_regex": args.gpu_model_regex,
-            "limit": get_settings().accounting_max_rows,
-        },
-    )
+    limit = _breakdown_limit(start_date, end_date)
+    if args.dimension in _LLM_ONLY_DIMENSIONS:
+        payload = await _llm_rows(
+            args.model_copy(update={"start_date": start_date, "end_date": end_date}),
+            ["date", args.dimension],
+            limit,
+        )
+    else:
+        payload = await call_mcp(
+            "query_resource_usage",
+            {
+                "group_by": ["date", args.dimension, "unit"],
+                "resource": args.resource,
+                "start_date": start_date,
+                "end_date": end_date,
+                "namespace": args.namespace,
+                "institution": args.institution,
+                "node_regex": args.node_regex,
+                "gpu_model_regex": args.gpu_model_regex,
+                "limit": limit,
+            },
+        )
     rows = _rows(payload)
     if not rows:
         return {
@@ -906,7 +1059,7 @@ async def _chart_breakdown(args: ChartArgs) -> dict[str, Any]:
             "note": "No accounting rows matched, so nothing was drawn. Say there is no data.",
         }
 
-    unit = _unit_label(str(rows[0].get("unit") or ""))
+    unit = _chart_unit(args, rows)
     dates = sorted({str(row.get("date") or "") for row in rows})
     date_index = {date: i for i, date in enumerate(dates)}
 
@@ -914,7 +1067,7 @@ async def _chart_breakdown(args: ChartArgs) -> dict[str, Any]:
     grid: dict[str, list[float]] = {}
     for row in rows:
         key = charts.clean_label(row.get(args.dimension) or "unknown")
-        usage = _number(row.get("usage"))
+        usage = _usage(row)
         totals[key] = totals.get(key, 0.0) + usage
         grid.setdefault(key, [0.0] * len(dates))[date_index[str(row.get("date") or "")]] += usage
 
@@ -930,7 +1083,13 @@ async def _chart_breakdown(args: ChartArgs) -> dict[str, Any]:
                 other[index] += value
         series.append(charts.Series(label=charts.OTHER_LABEL, values=tuple(other)))
 
-    window = _window(payload)
+    # Captioned with the days actually plotted, not the window that was asked
+    # for: hitting the row limit returns the most recent rows, and a quarter's
+    # title over six weeks of bands is a chart that lies about its own axis.
+    window = f"{dates[0]} to {dates[-1]}" if dates[0] != dates[-1] else dates[0]
+    requested = _window(payload)
+    window_requested = requested if requested != window else None
+
     title = args.title or f"{unit} by {args.dimension}"
     title = charts.clean_label(title)
     png = charts.render_trend(
@@ -959,4 +1118,5 @@ async def _chart_breakdown(args: ChartArgs) -> dict[str, Any]:
         window=window,
         plotted=[{args.dimension: item.label, "total": round(item.total, 3)} for item in series]
         + ([{"folded_into_other": len(folded)}] if folded else []),
+        window_requested=window_requested,
     )

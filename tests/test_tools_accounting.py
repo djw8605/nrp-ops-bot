@@ -110,6 +110,19 @@ TREND_ROWS = {
 }
 
 
+LLM_DAILY_ROWS = {
+    "metric": "tokens_used",
+    "start_date": "2026-08-11",
+    "end_date": "2026-08-12",
+    "rows": [
+        {"date": "2026-08-11", "model": "deepseek-v4-flash", "tokens_used": 1000.0},
+        {"date": "2026-08-12", "model": "deepseek-v4-flash", "tokens_used": 1600.0},
+        {"date": "2026-08-11", "model": "gemma", "tokens_used": 40.0},
+        {"date": "2026-08-12", "model": "gemma", "tokens_used": 57.0},
+    ],
+}
+
+
 class TestEnvelope:
     async def test_call_is_a_stateless_jsonrpc_post(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen = install(monkeypatch, result(TOP_ROWS))
@@ -498,6 +511,245 @@ class TestCharts:
         drawn = out["plotted"][0]["namespace"]
         assert "AKIAIOSFODNN7EXAMPLE" not in drawn
         assert "REDACTED" in drawn
+
+
+class TestLlmCharts:
+    """A question like "plot the most used LLM models by day" was
+    unsatisfiable: `dimension` accepted only the four rank dimensions, so `dimension='model'` failed
+    validation and no chart could ever be drawn for it.
+
+    Rows come from a different table with different column names -- the real
+    payload shape is copied here: ``tokens_used`` rather than ``usage``, and no
+    ``unit`` column at all.
+    """
+
+    async def test_a_breakdown_by_model_reads_the_llm_token_table(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = install(
+            monkeypatch,
+            results(
+                {
+                    "get_latest_data_date": {"latest_data_date": "2026-08-12"},
+                    "query_llm_token_usage": LLM_DAILY_ROWS,
+                }
+            ),
+        )
+        with charts.collecting(2) as collector:
+            out = await accounting.accounting_chart(
+                accounting.ChartArgs(kind="breakdown", resource="llm", dimension="model")
+            )
+
+        # The model dimension lives only in query_llm_token_usage; asking
+        # query_resource_usage for it returns rows with no such column.
+        args = sent(seen[1])["params"]["arguments"]
+        assert sent(seen[1])["params"]["name"] == "query_llm_token_usage"
+        assert args["group_by"] == ["date", "model"]
+        assert out["attached"] is True
+        assert out["unit"] == "tokens"
+        assert len(collector.charts) == 1
+        # Read from tokens_used, not usage: the wrong column silently plots zeros.
+        assert {"model": "deepseek-v4-flash", "total": 2600.0} in out["plotted"]
+
+    async def test_a_ranking_of_models_reads_the_llm_token_table(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = install(
+            monkeypatch,
+            result(
+                {
+                    "metric": "tokens_used",
+                    "start_date": "2026-08-12",
+                    "end_date": "2026-08-12",
+                    "rows": [
+                        {"model": "gemma", "tokens_used": 57.0},
+                        {"model": "deepseek-v4-flash", "tokens_used": 1600.0},
+                    ],
+                }
+            ),
+        )
+        with charts.collecting(2) as collector:
+            out = await accounting.accounting_chart(
+                accounting.ChartArgs(
+                    kind="ranking",
+                    resource="llm",
+                    dimension="model",
+                    start_date="2026-08-12",
+                    end_date="2026-08-12",
+                )
+            )
+        assert sent(seen[0])["params"]["name"] == "query_llm_token_usage"
+        # Rows arrive in whatever order the table returns them; a ranking must
+        # be ranked.
+        assert out["plotted"] == [
+            {"model": "deepseek-v4-flash", "usage": 1600.0},
+            {"model": "gemma", "usage": 57.0},
+        ]
+        assert len(collector.charts) == 1
+
+    async def test_a_model_dimension_needs_the_llm_resource(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        install(monkeypatch, result({}))
+        with charts.collecting(2):
+            out = await dispatch(
+                "accounting_chart",
+                {"kind": "breakdown", "resource": "gpu", "dimension": "model"},
+            )
+        assert out.ok is False
+        assert out.content["error"] == "invalid_arguments"
+        assert "resource='llm'" in out.content["message"]
+
+    async def test_a_gpu_filter_on_an_llm_breakdown_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The token table has no node or GPU columns. Ignoring the filter would
+        draw a cluster-wide chart under a title claiming it was filtered."""
+        install(monkeypatch, result({}))
+        with charts.collecting(2):
+            out = await dispatch(
+                "accounting_chart",
+                {
+                    "kind": "breakdown",
+                    "resource": "llm",
+                    "dimension": "model",
+                    "gpu_model_regex": "A100",
+                },
+            )
+        assert out.ok is False
+        assert out.content["error"] == "invalid_arguments"
+        assert "gpu_model_regex" in out.content["message"]
+
+    async def test_a_model_trend_points_at_the_breakdown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        install(monkeypatch, result({}))
+        with charts.collecting(2):
+            out = await dispatch(
+                "accounting_chart",
+                {"kind": "trend", "resource": "llm", "dimension": "model", "value": "qwen3"},
+            )
+        assert out.ok is False
+        assert "breakdown" in out.content["message"]
+
+    async def test_llm_tokens_by_namespace_still_use_the_usage_table(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Namespace, institution and node all exist for resource='llm' in the
+        usage table, so only the token-table dimensions are rerouted."""
+        seen = install(
+            monkeypatch,
+            results(
+                {
+                    "get_latest_data_date": {"latest_data_date": "2026-08-12"},
+                    "query_resource_usage": {
+                        "rows": [{"date": "2026-08-12", "namespace": "coder", "usage": 12.0}],
+                        "start_date": "2026-07-14",
+                        "end_date": "2026-08-12",
+                    },
+                }
+            ),
+        )
+        with charts.collecting(2):
+            out = await accounting.accounting_chart(
+                accounting.ChartArgs(kind="breakdown", resource="llm", dimension="namespace")
+            )
+        assert sent(seen[1])["params"]["name"] == "query_resource_usage"
+        # Neither table reports a unit for llm rows, but they are tokens, and an
+        # axis reading "usage" says less than it could.
+        assert out["unit"] == "tokens"
+
+
+class TestBreakdownWindow:
+    """A daily breakdown multiplies days by dimension values, so the row cap can
+    be reached before the window is covered -- and the rows that arrive are the
+    most recent ones. The chart used to be titled with the window that was
+    *asked for* while drawing the shorter one it got: 92 days requested, 42
+    drawn, nothing saying so.
+    """
+
+    @staticmethod
+    def _daily(start: str, days: int, models: int = 3) -> dict[str, Any]:
+        from datetime import date, timedelta
+
+        first = date.fromisoformat(start)
+        return {
+            "metric": "tokens_used",
+            "start_date": start,
+            "end_date": (first + timedelta(days=days - 1)).isoformat(),
+            "rows": [
+                {
+                    "date": (first + timedelta(days=day)).isoformat(),
+                    "model": f"m-{index}",
+                    "tokens_used": 100.0 + index,
+                }
+                for day in range(days)
+                for index in range(models)
+            ],
+        }
+
+    async def test_the_row_limit_is_sized_to_the_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = install(
+            monkeypatch,
+            result(self._daily("2026-05-17", 92)),
+            accounting_max_rows=500,
+        )
+        with charts.collecting(2):
+            await accounting.accounting_chart(
+                accounting.ChartArgs(
+                    kind="breakdown",
+                    resource="llm",
+                    dimension="model",
+                    start_date="2026-05-17",
+                    end_date="2026-08-17",
+                )
+            )
+        # 92 days of a dozen models does not fit in 500 rows, and asking for 500
+        # returns the last 42 days of the quarter.
+        assert sent(seen[0])["params"]["arguments"]["limit"] > 500
+
+    async def test_a_short_row_set_is_titled_with_the_days_it_actually_has(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The server echoes the requested window but returns only recent rows.
+        payload = self._daily("2026-07-07", 42)
+        payload["start_date"] = "2026-05-17"
+        install(monkeypatch, result(payload))
+        with charts.collecting(2) as collector:
+            out = await accounting.accounting_chart(
+                accounting.ChartArgs(
+                    kind="breakdown",
+                    resource="llm",
+                    dimension="model",
+                    start_date="2026-05-17",
+                    end_date="2026-08-17",
+                )
+            )
+        assert out["window"] == "2026-07-07 to 2026-08-17"
+        assert "2026-05-17" in out["window_requested"]
+        assert "row limit" in out["note"]
+        # The picture must not caption itself with a window it does not show.
+        assert "2026-07-07" in collector.charts[0].alt_text
+
+    async def test_a_complete_row_set_says_nothing_extra(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        install(monkeypatch, result(self._daily("2026-08-01", 5)))
+        with charts.collecting(2):
+            out = await accounting.accounting_chart(
+                accounting.ChartArgs(
+                    kind="breakdown",
+                    resource="llm",
+                    dimension="model",
+                    start_date="2026-08-01",
+                    end_date="2026-08-05",
+                )
+            )
+        assert out["window"] == "2026-08-01 to 2026-08-05"
+        assert "window_requested" not in out
+        assert "row limit" not in out["note"]
 
 
 class TestRegistration:

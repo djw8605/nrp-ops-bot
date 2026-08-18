@@ -64,6 +64,7 @@ class FakeAgent:
         self._result = result
         self.calls: list[str] = []
         self.histories: list[list[ThreadMessage]] = []
+        self.thread_keys: list[str | None] = []
 
     async def investigate(
         self,
@@ -71,9 +72,11 @@ class FakeAgent:
         *,
         history: Any = None,
         progress: Any = None,
+        thread_key: str | None = None,
     ) -> AgentResult:
         self.calls.append(message)
         self.histories.append(list(history or []))
+        self.thread_keys.append(thread_key)
         if progress is not None:
             await progress("checking: list_pods")
         if isinstance(self._result, Exception):
@@ -173,6 +176,23 @@ class TestThreadContext:
         base = {"ts": "1754999999.000002", "user": OPERATOR, "text": "coder is down"}
         base.update(kw)
         return base
+
+    async def test_the_thread_identifies_itself_to_the_agent(self) -> None:
+        """The agent carries the previous turn's tool results per thread, so it
+        needs to know which thread this is -- channel included, since two
+        channels can hold the same parent timestamp."""
+        ops = make_ops(AgentResult(text="ok"))
+        client = FakeSlackClient()
+        await ops.handle(event(thread_ts=self.THREAD), client)
+        agent: Any = ops._agent
+        assert agent.thread_keys == [f"{CHANNEL}:{self.THREAD}"]
+
+    async def test_a_thread_opener_keys_on_its_own_timestamp(self) -> None:
+        ops = make_ops(AgentResult(text="ok"))
+        client = FakeSlackClient()
+        await ops.handle(event(), client)
+        agent: Any = ops._agent
+        assert agent.thread_keys == [f"{CHANNEL}:1755000000.000100"]
 
     async def test_earlier_thread_turns_reach_the_agent(self) -> None:
         ops = make_ops(AgentResult(text="ok"))
@@ -339,6 +359,16 @@ class TestFormatReply:
 
     def test_a_clean_answer_has_no_footnote_line(self) -> None:
         assert format_reply(AgentResult(text="all healthy")) == "all healthy"
+
+    def test_a_truncated_answer_says_so_in_the_thread(self) -> None:
+        """The bug this footnote exists for: an answer cut off at the model's
+        output limit reached Slack ending mid-word, with nothing marking it as
+        incomplete, so it read as a finished finding."""
+        result = AgentResult(
+            text="the fastest-growing models are qwen3-small and deepseek-v4",
+            stop_reason="truncated",
+        )
+        assert "stopped: truncated" in format_reply(result)
 
 
 class TestReplyIsSlackFormatted:

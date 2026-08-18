@@ -37,6 +37,9 @@ AuditEvent = Literal[
     "authz_deny",
     "model_call",
     "model_error",
+    # An answer cut off at the output limit, before it was re-asked. Separate
+    # from model_error: the endpoint did nothing wrong.
+    "model_truncated",
     "tool_call",
     "tool_error",
     "redaction_hit",

@@ -156,6 +156,20 @@ Call it *instead of* the matching query tool, not after it.
 | `ranking` | horizontal bars, largest first, value at each tip | "who are the top consumers?" |
 | `breakdown` | stacked areas, tail folded into *Other* | "how does the total split, and is that shifting?" |
 
+Bars and bands split by `namespace`, `institution`, `node` or `commercial`, and — with
+`resource='llm'` — by `model`, `token_alias` or `token_type`. Those last three live only in the LLM
+token table, which is keyed differently (`tokens_used`, no `unit` column) and holds no node or GPU
+columns, so `accounting_chart` reads them from `query_llm_token_usage` and refuses the filters that
+table cannot apply rather than dropping them silently. Without them, "plot the most used LLM models
+by day" had no answerable form at all: `dimension='model'` failed validation, and the model retried
+it rather than finding another way.
+
+A `breakdown` sizes its row request to the window it was asked for. The row cap is a *total* and a
+daily breakdown multiplies days by values, so a quarter-long question used to come back as its most
+recent six weeks — under a subtitle still naming the quarter, which inverted the ranking it was drawn
+to show. The chart is now captioned with the days it actually has, and a short row set reports
+`window_requested` so the reply can say what it does not cover.
+
 The image travels **out of band**: a context-local collector in
 [`charts.py`](src/nrp_ops_agent/charts.py) carries it from the tool to `AgentResult.charts`, and
 `slack_app._upload_charts` posts it into the thread after the text. Image bytes never enter the
@@ -230,11 +244,48 @@ tool would refuse.
 
 ## Agent loop
 
-Hand-rolled in `agent.py`, roughly 300 lines, no agent framework. Budgets, all env-driven: 12 tool
+Hand-rolled in `agent.py`, around 600 lines, no agent framework. Budgets, all env-driven: 12 tool
 calls per turn, 8 loop iterations, 120 s wall clock, 60k tokens of accumulated tool output. When the
 output cap is hit the oldest results are dropped **and the model is told they were dropped**, so it
 does not silently reason from a truncated picture. Model faults, tool faults and timeouts all become
 reported outcomes rather than exceptions.
+
+### An answer cut off at the output limit
+
+`finish_reason: length` means the endpoint stopped the model mid-sentence, and it is the one signal
+that separates a finished finding from half of one. The loop reads it: the partial answer is
+discarded — nothing has been posted yet, since the ack message is edited only once the turn ends —
+and asked for again, shorter. Discarded rather than continued, because stitching a second generation
+onto a sentence that stopped mid-word leaves a seam in the middle of the finding.
+
+If the retry is cut off too, what was written is posted with `stopped: truncated` in the footnote and
+`ok: false` in the audit. The failure that made this necessary was quieter than that: a reply ending
+mid-word read as a complete answer, and an operator asking it to continue got a fresh investigation
+of the same question.
+
+A reasoning model can also spend its whole budget in `reasoning_content` and return empty `content`.
+That is `empty_answer`, not `answered` — the model produced nothing, and the reply says so instead of
+claiming an answer with no text in it.
+
+`NRP_OPS_LLM_MAX_TOKENS` is the served model's own documented ceiling (100k for deepseek-v4, which
+carries a 1M-token context), not a house style. It is a ceiling and not a target: what actually
+bounds a long generation is `NRP_OPS_LLM_TIMEOUT_S` (90 s) and the 120 s wall clock, and the Slack
+reply is capped at 3500 characters regardless. Raising it buys headroom for reasoning tokens, not
+longer replies.
+
+### A follow-up does not re-run the investigation
+
+Thread history replays what was *said* — the bot's own text included — but not the tool results
+behind it, so a second turn in a thread had the trace of its first turn with none of the data. The
+answer was to query everything again. The last turn's tool exchange is carried per thread instead,
+keyed by channel and parent timestamp, and replayed with a note saying it is from the previous turn
+and may be stale.
+
+In-process and deliberately not persisted: the Deployment runs one replica, a restart costs one
+re-query, and a thread's results have no business outliving the pod. Bounded three ways — 20k
+characters, 30 minutes, 32 threads — because a cache in a process that runs for weeks needs a lid,
+and because replaying a half-hour-old pod list as though it were current is worse than looking again.
+Carried results keep the `<untrusted_tool_output>` wrapper they were first stored with.
 
 ---
 
@@ -266,11 +317,15 @@ endpoint, credential, namespace or Slack ID is hardcoded anywhere else in the pa
 | `NRP_OPS_CHARTS_MAX_PER_TURN` | `2` | past this the chart tool refuses rather than dropping |
 | `NRP_OPS_LLM_BASE_URL` | `https://ellm.nrp-nautilus.io/v1` | `/v1` verified; POST needs a key |
 | `NRP_OPS_LLM_API_KEY` / `_MODEL` | — | `_MODEL` has no default on purpose |
-| `NRP_OPS_LLM_TEMPERATURE` / `_MAX_TOKENS` | `0.0` / `2048` | |
+| `NRP_OPS_LLM_TEMPERATURE` / `_MAX_TOKENS` | `0.0` / `100000` | the served model's own output ceiling; see below |
 | `NRP_OPS_AGENT_MAX_TOOL_CALLS` | `12` | per turn |
 | `NRP_OPS_AGENT_MAX_ITERATIONS` | `8` | loop iterations |
-| `NRP_OPS_AGENT_WALL_CLOCK_TIMEOUT_S` | `120` | |
+| `NRP_OPS_AGENT_MAX_TRUNCATION_RETRIES` | `1` | re-asks for a shorter answer when one is cut off; `0` posts the partial, marked |
+| `NRP_OPS_AGENT_WALL_CLOCK_TIMEOUT_S` | `120` | the real bound on generation once `_MAX_TOKENS` is this high |
 | `NRP_OPS_AGENT_TOOL_OUTPUT_TOKEN_BUDGET` | `60000` | oldest results dropped past this |
+| `NRP_OPS_AGENT_THREAD_MEMO_CHAR_BUDGET` | `20000` | previous turn's tool results carried into a follow-up; `0` disables |
+| `NRP_OPS_AGENT_THREAD_MEMO_TTL_S` | `1800` | past this a follow-up starts clean |
+| `NRP_OPS_AGENT_THREAD_MEMO_MAX_THREADS` | `32` | threads held; least recently answered evicted first |
 | `NRP_OPS_DOCS_DB_PATH` | `/var/lib/nrp-ops-agent/docs.sqlite3` | emptyDir shared with the sidecar |
 | `NRP_OPS_DOCS_REPO_URL` | `https://gitlab.nrp-nautilus.io/prp/nrp-site.git` | |
 | `NRP_OPS_AUDIT_STREAM` | `stdout` | |
@@ -368,8 +423,13 @@ One JSON object per line on stdout. Stable keys; absent fields are omitted rathe
 | `ok` | bool | outcome-bearing events |
 
 `event` is one of `startup`, `policy_reload`, `authz_allow`, `authz_deny`, `model_call`,
-`model_error`, `tool_call`, `tool_error`, `redaction_hit`, `thread_history`, `chart_upload`,
-`reply_sent`.
+`model_error`, `model_truncated`, `tool_call`, `tool_error`, `redaction_hit`, `thread_history`,
+`chart_upload`, `reply_sent`.
+
+`model_call` carries `finish_reason` alongside its token counts. `length` there is the endpoint
+saying the answer was cut off, and `model_truncated` follows when that answer was discarded and
+re-asked; a `reply_sent` with `reason: truncated` is one that survived the retry and reached Slack
+marked as incomplete.
 
 `chart_upload` records one attempted image upload (`filename`, plus `result_bytes` on success).
 `ok: false` there is almost always a workspace installed without `files:write`; the reply itself

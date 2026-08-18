@@ -42,6 +42,19 @@ class TestSettings:
         with pytest.raises(ValueError, match="kube_mode"):
             Settings(_env_file=None)
 
+    def test_output_ceiling_matches_the_served_model(self) -> None:
+        """2048 was well under what the models here can write, so a finding plus
+        its evidence was routinely cut off mid-sentence. deepseek-v4 documents a
+        1M-token context and 100k of output."""
+        settings = Settings(_env_file=None)
+        assert settings.llm_max_tokens == 100_000
+
+    def test_a_hundred_thousand_token_ceiling_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("NRP_OPS_LLM_MAX_TOKENS", "100000")
+        assert Settings(_env_file=None).llm_max_tokens == 100_000
+
     def test_settings_are_frozen(self) -> None:
         settings = Settings(_env_file=None)
         with pytest.raises(ValueError, match="frozen"):

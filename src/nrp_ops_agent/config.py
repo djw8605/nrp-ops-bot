@@ -47,8 +47,8 @@ class Settings(BaseSettings):
     slack_bot_token: SecretStr = Field(
         default=SecretStr(""),
         description="xoxb-... bot token. Scopes: app_mentions:read, chat:write, "
-        "im:history, reactions:write, and channels:history/groups:history for "
-        "reading thread context in channels.",
+        "im:history, reactions:write, channels:history/groups:history for reading "
+        "thread context in channels, and files:write for uploading charts.",
     )
     slack_app_token: SecretStr = Field(
         default=SecretStr(""),
@@ -193,13 +193,50 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr = Field(default=SecretStr(""))
     llm_model: str = Field(default="")
     llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    llm_max_tokens: int = Field(default=2048, ge=1, le=32768)
+    # The model's own documented output ceiling, not a house style: an answer
+    # cut off at this limit is discarded and re-asked (see
+    # `agent_max_truncation_retries`), so a ceiling set below what the model can
+    # write buys nothing but retries. deepseek-v4 carries a 1M-token context and
+    # 100k of output. Generation is bounded in practice by `llm_timeout_s` and
+    # `agent_wall_clock_timeout_s`, which stop a runaway long before 100k tokens.
+    llm_max_tokens: int = Field(default=100_000, ge=1, le=1_000_000)
     llm_timeout_s: float = Field(default=90.0, gt=0, le=600)
 
     # ----------------------------------------------------------------- Agent --
     agent_max_tool_calls: int = Field(default=12, ge=1, le=64)
     agent_max_iterations: int = Field(default=8, ge=1, le=32)
+    agent_max_truncation_retries: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        description="How many times an answer cut off at the output limit is discarded "
+        "and asked for again, shorter. 0 posts the partial answer, marked as truncated.",
+    )
     agent_wall_clock_timeout_s: float = Field(default=120.0, gt=0, le=900)
+    # A follow-up in a thread ("continue", "is it still broken?") reaches the
+    # model with the bot's earlier *text* but none of the tool results behind it,
+    # so it re-runs the whole investigation to answer. The last turn's tool
+    # exchange is carried per thread instead. Kept small and short-lived: this is
+    # a cache to save a re-query, not a transcript store, and stale cluster state
+    # replayed as current is worse than no state at all.
+    agent_thread_memo_char_budget: int = Field(
+        default=20_000,
+        ge=0,
+        description="Characters of the previous turn's tool results carried into a "
+        "follow-up in the same thread. 0 disables carrying entirely.",
+    )
+    agent_thread_memo_ttl_s: float = Field(
+        default=1800.0,
+        ge=0,
+        description="How long carried tool results stay usable. Past this a follow-up "
+        "starts clean.",
+    )
+    agent_thread_memo_max_threads: int = Field(
+        default=32,
+        ge=1,
+        description="Threads held in the carry cache. The least recently answered is "
+        "evicted first.",
+    )
     agent_tool_output_token_budget: int = Field(
         default=60_000,
         ge=1_000,

@@ -30,7 +30,16 @@ def tool_turn(name: str, args: dict[str, Any], call_id: str = "c1") -> dict[str,
 
 
 def answer(text: str) -> dict[str, Any]:
-    return {"content": text, "tool_calls": []}
+    return {"content": text, "tool_calls": [], "finish_reason": "stop"}
+
+
+def cut_off(text: str) -> dict[str, Any]:
+    """A reply the endpoint stopped mid-sentence at ``max_tokens``.
+
+    ``finish_reason`` is folded into the message by :meth:`Agent._complete`; the
+    real API carries it on the choice around it.
+    """
+    return {"content": text, "tool_calls": [], "finish_reason": "length"}
 
 
 class Scripted:
@@ -127,6 +136,183 @@ class TestLoopControl:
         assert [c.name for c in result.tool_calls] == ["list_pods", "get_events"]
         tool_msgs = [m for m in model.seen[-1] if m.get("role") == "tool"]
         assert [m["tool_call_id"] for m in tool_msgs] == ["a", "b"]
+
+
+@pytest.mark.usefixtures("allow_all_namespaces")
+class TestTruncatedAnswers:
+    """A reply cut off at ``max_tokens`` used to be posted as a finished finding.
+
+    The endpoint reports it on ``finish_reason``, which the loop discarded, so a
+    sentence ending mid-word reached Slack with no marker on it -- and when a
+    reasoning model spent the whole budget before writing any prose, the empty
+    content became "produced no answer" with ``stop_reason='answered'``.
+    """
+
+    async def test_a_truncated_answer_is_asked_for_again_shorter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, model = make_agent(
+            monkeypatch,
+            [
+                cut_off("the fastest-growing models are qwen3-small, glm-5 and deepseek-v4"),
+                answer("qwen3-small leads."),
+            ],
+        )
+        result = await agent.investigate("which models are growing?")
+        assert result.text == "qwen3-small leads."
+        assert result.stop_reason == "answered"
+        assert model.calls == 2
+        # The half-written answer is discarded rather than replayed: continuing
+        # it would post a stitched sentence, and nothing has reached Slack yet.
+        assert not any("deepseek-v4" in str(m.get("content") or "") for m in model.seen[1])
+        note = str(model.seen[1][-1]["content"])
+        assert "cut off" in note
+
+    async def test_a_persistently_truncated_answer_is_reported_as_truncated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _ = make_agent(monkeypatch, [cut_off("part one"), cut_off("part two")])
+        result = await agent.investigate("which models are growing?")
+        assert result.stop_reason == "truncated"
+        assert result.ok is False
+        # What was written still reaches the operator -- with the stop reason
+        # beside it, which is what format_reply turns into a footnote.
+        assert result.text == "part two"
+
+    async def test_a_budget_spent_entirely_on_reasoning_is_not_an_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """deepseek-v4-flash can burn every token in ``reasoning_content`` and
+        return empty ``content``. That is a fault, not a finding."""
+        agent, _ = make_agent(monkeypatch, [cut_off(""), cut_off("")])
+        result = await agent.investigate("which models are growing?")
+        assert result.stop_reason == "truncated"
+        assert result.ok is False
+        assert "output budget" in result.text
+
+    async def test_an_empty_answer_is_not_reported_as_answered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _ = make_agent(monkeypatch, [answer("")])
+        result = await agent.investigate("anything broken?")
+        assert result.stop_reason == "empty_answer"
+        assert result.ok is False
+
+    async def test_retrying_a_truncated_answer_can_be_turned_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, model = make_agent(
+            monkeypatch, [cut_off("half a finding")], agent_max_truncation_retries=0
+        )
+        result = await agent.investigate("which models are growing?")
+        assert model.calls == 1
+        assert result.stop_reason == "truncated"
+
+
+@pytest.mark.usefixtures("allow_all_namespaces")
+class TestThreadMemo:
+    """A follow-up in a thread used to re-run the whole investigation.
+
+    Thread history replays the bot's *text*, so a second turn saw its own tool
+    trace with none of the results behind it: "continue" meant re-querying
+    everything, at the cost of the context the answer needed. The last turn's
+    tool exchange is carried instead, keyed by thread.
+    """
+
+    KEY = "C0OPS:1787078899.210349"
+
+    async def _first_turn(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any, **cfg: Any
+    ) -> Agent:
+        fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
+        agent, _ = make_agent(
+            monkeypatch,
+            [tool_turn("list_pods", {"namespace": "coder"}), answer("coder has no pods")],
+            **cfg,
+        )
+        await agent.investigate("coder down?", thread_key=self.KEY)
+        return agent
+
+    async def test_the_previous_turns_tool_results_are_carried(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        agent = await self._first_turn(monkeypatch, fake_kube)
+        second = Scripted([answer("still no pods")])
+        monkeypatch.setattr(agent, "_complete", second)
+        await agent.investigate("continue", thread_key=self.KEY)
+
+        roles = [m["role"] for m in second.seen[0]]
+        assert "tool" in roles
+        replayed = next(m for m in second.seen[0] if m["role"] == "tool")
+        assert replayed["name"] == "list_pods"
+        # Every replayed tool result must still be paired with the assistant
+        # turn that called it, or the endpoint rejects the whole request.
+        called = {
+            call["id"]
+            for m in second.seen[0]
+            if m["role"] == "assistant"
+            for call in (m.get("tool_calls") or [])
+        }
+        assert {m["tool_call_id"] for m in second.seen[0] if m["role"] == "tool"} <= called
+
+    async def test_another_thread_starts_clean(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        agent = await self._first_turn(monkeypatch, fake_kube)
+        second = Scripted([answer("fresh")])
+        monkeypatch.setattr(agent, "_complete", second)
+        await agent.investigate("what about braingeneers?", thread_key="C0OPS:other")
+        assert not any(m["role"] == "tool" for m in second.seen[0])
+
+    async def test_a_turn_outside_a_thread_carries_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        agent = await self._first_turn(monkeypatch, fake_kube)
+        second = Scripted([answer("fresh")])
+        monkeypatch.setattr(agent, "_complete", second)
+        await agent.investigate("unrelated question")
+        assert not any(m["role"] == "tool" for m in second.seen[0])
+
+    async def test_the_carry_can_be_turned_off(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        agent = await self._first_turn(monkeypatch, fake_kube, agent_thread_memo_char_budget=0)
+        second = Scripted([answer("fresh")])
+        monkeypatch.setattr(agent, "_complete", second)
+        await agent.investigate("continue", thread_key=self.KEY)
+        assert not any(m["role"] == "tool" for m in second.seen[0])
+
+    async def test_a_stale_thread_is_not_carried(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        """Cluster state moves. An hour-old tool result is worse than none."""
+        agent = await self._first_turn(monkeypatch, fake_kube, agent_thread_memo_ttl_s=0.0)
+        second = Scripted([answer("fresh")])
+        monkeypatch.setattr(agent, "_complete", second)
+        await agent.investigate("continue", thread_key=self.KEY)
+        assert not any(m["role"] == "tool" for m in second.seen[0])
+
+    async def test_carried_results_are_marked_as_the_previous_turns(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        agent = await self._first_turn(monkeypatch, fake_kube)
+        second = Scripted([answer("still no pods")])
+        monkeypatch.setattr(agent, "_complete", second)
+        await agent.investigate("continue", thread_key=self.KEY)
+        notes = [str(m["content"]) for m in second.seen[0] if m["role"] == "system"]
+        assert any("previous turn" in note and "stale" in note for note in notes)
+
+    async def test_only_the_newest_threads_are_kept(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        """The memo is a cache in a long-lived process, not a transcript store."""
+        fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
+        agent, _ = make_agent(monkeypatch, [], agent_thread_memo_max_threads=2)
+        for index in range(3):
+            scripted = Scripted([tool_turn("list_pods", {"namespace": "coder"}), answer("ok")])
+            monkeypatch.setattr(agent, "_complete", scripted)
+            await agent.investigate("coder down?", thread_key=f"C0OPS:{index}")
+        assert sorted(agent._memos) == ["C0OPS:1", "C0OPS:2"]
 
 
 @pytest.mark.usefixtures("allow_all_namespaces")

@@ -234,7 +234,13 @@ class SlackOps:
 
             try:
                 result = await self._agent.investigate(
-                    event.text, history=history, progress=progress
+                    event.text,
+                    history=history,
+                    progress=progress,
+                    # Channel included: the same parent timestamp can exist in
+                    # two channels, and one thread's results must not surface in
+                    # another's.
+                    thread_key=f"{event.channel}:{event.reply_thread_ts}",
                 )
             except Exception as exc:
                 log.exception("investigation failed")
