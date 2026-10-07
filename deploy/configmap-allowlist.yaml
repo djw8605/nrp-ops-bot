@@ -35,6 +35,7 @@ data:
       - U0B2EEL3R7W  # Sam
       - U0B27J7018D  # Huijun
       - U0B27J4PM29  # Ashton
+      - U0B2ABZBK0V  # TODO: name
 
     # WHERE @mentions are honoured, as a second gate on top of `operators`.
     # A channel mention needs BOTH: an allowlisted user in an allowlisted
