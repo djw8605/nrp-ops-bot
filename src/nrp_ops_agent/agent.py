@@ -52,6 +52,27 @@ from nrp_ops_agent.tools import ToolResult, dispatch, tool_schemas
 #: 25% error changes nothing that matters.
 CHARS_PER_TOKEN: Final = 4
 
+#: Told to the model on the step a budget runs out, which is offered no tools.
+_FORCED_NOTES: Final = {
+    "tool_budget": "Tool call budget exhausted, and no tools are available on this step. "
+    "Answer now from what you already have, and say what you did not get to check.",
+    "iteration_budget": "This is the last step of the turn, and no tools are available on it. "
+    "Answer now from what you already have, and say what you did not get to check.",
+    "time_budget": "The turn is almost out of time, and no tools are available on this step. "
+    "Answer now from what you already have, and say what you did not get to check.",
+}
+#: Why a forced step produced no answer, in the words ``_partial`` reports.
+_FORCED_WHY: Final = {
+    "tool_budget": "spent the tool call budget",
+    "iteration_budget": "hit the iteration limit",
+    "time_budget": "ran low on time",
+}
+
+
+def _is_dropped(message: dict[str, Any]) -> bool:
+    return str(message.get("content") or "").startswith("[dropped")
+
+
 ProgressFn = Callable[[str], Awaitable[None]]
 
 
@@ -116,6 +137,8 @@ class AgentResult:
     stop_reason: str = "answered"
     redaction_rules: list[str] = field(default_factory=list)
     dropped_results: int = 0
+    #: Calls answered by pointing at an identical earlier call in the turn.
+    repeated_calls: int = 0
     #: Images drawn during this turn, for the caller to upload. They travel
     #: beside the text rather than inside it: a tool result is JSON in the model
     #: context, and a PNG is neither.
@@ -123,7 +146,7 @@ class AgentResult:
 
     @property
     def ok(self) -> bool:
-        return self.stop_reason in ("answered", "tool_budget", "iteration_budget")
+        return self.stop_reason in ("answered", "tool_budget", "iteration_budget", "time_budget")
 
 
 class ModelError(Exception):
@@ -165,13 +188,20 @@ class Agent:
             await self._client.aclose()
             self._client = None
 
-    async def _complete(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        """One chat completion. Retries once on a transient transport failure."""
+    async def _complete(
+        self, messages: list[dict[str, Any]], *, allow_tools: bool = True
+    ) -> dict[str, Any]:
+        """One chat completion. Retries once on a transient transport failure.
+
+        ``allow_tools=False`` asks for an answer only. The schemas are still
+        sent: the history holds tool calls, and some chat templates cannot render
+        those without the definitions beside them.
+        """
         payload = {
             "model": self._settings.llm_model,
             "messages": messages,
             "tools": tool_schemas(),
-            "tool_choice": "auto",
+            "tool_choice": "auto" if allow_tools else "none",
             "temperature": self._settings.llm_temperature,
             "max_tokens": self._settings.llm_max_tokens,
         }
@@ -326,6 +356,16 @@ class Agent:
         result = AgentResult(text="")
         calls_made = 0
         retries = 0
+        reserve = settings.agent_answer_reserve_s
+        # Results this turn already has, by call, so a repeat is pointed at the
+        # earlier answer instead of being run -- and paid for -- again. The value
+        # is the tool message itself: the output budget blanks dropped results in
+        # place, and a pointer to a blanked result is no answer at all.
+        fetched: dict[tuple[str, str], dict[str, Any]] = {}
+        # Set once a budget runs out. From then on the model is offered no
+        # tools, so the turn ends in a write-up of what was found rather than in
+        # a list of tool names: a spent budget used to discard every result.
+        forced: str | None = None
 
         for iteration in range(1, settings.agent_max_iterations + 1):
             result.iterations = iteration
@@ -335,11 +375,31 @@ class Agent:
                 result.text = self._partial(result, "ran out of time")
                 return result
 
+            if forced is None:
+                if calls_made >= settings.agent_max_tool_calls:
+                    forced = "tool_budget"
+                elif deadline - time.monotonic() <= reserve:
+                    forced = "time_budget"
+                elif iteration == settings.agent_max_iterations:
+                    forced = "iteration_budget"
+                if forced is not None:
+                    messages.append(self._system_note(_FORCED_NOTES[forced]))
+
+            # A step that may still call tools must not run into the reserve:
+            # cut off at its edge, it hands the remaining time to the answer.
+            if forced is None:
+                timeout = deadline - reserve - time.monotonic()
+            else:
+                timeout = max(1.0, deadline - time.monotonic())
             try:
                 reply = await asyncio.wait_for(
-                    self._complete(messages), timeout=max(1.0, deadline - time.monotonic())
+                    self._complete(messages, allow_tools=forced is None), timeout=timeout
                 )
             except TimeoutError:
+                if forced is None and reserve > 0:
+                    forced = "time_budget"
+                    messages.append(self._system_note(_FORCED_NOTES[forced]))
+                    continue
                 result.stop_reason = "timeout"
                 result.text = self._partial(result, "ran out of time waiting for the model")
                 return result
@@ -351,9 +411,14 @@ class Agent:
             tool_calls = reply.get("tool_calls") or []
             content = (reply.get("content") or "").strip()
             truncated = str(reply.get("finish_reason") or "") == "length"
+            if forced is not None:
+                # ``tool_choice: none`` is advisory on some endpoints. A call
+                # made anyway is not run: the budget is the budget.
+                tool_calls = []
 
             if not tool_calls:
-                if truncated and retries < settings.agent_max_truncation_retries:
+                retry_left = iteration < settings.agent_max_iterations
+                if truncated and retries < settings.agent_max_truncation_retries and retry_left:
                     # Cut off at max_tokens. Nothing has been posted yet -- the
                     # ack is edited only once the turn ends -- so the half answer
                     # is discarded and asked for again, short enough to finish.
@@ -391,11 +456,15 @@ class Agent:
                     # A reasoning model can return an empty ``content`` with its
                     # whole turn in ``reasoning_content``. That is a fault, and
                     # calling it "answered" is what hid it.
-                    result.stop_reason = "empty_answer"
-                    result.text = self._partial(result, "produced no answer")
+                    result.stop_reason = forced or "empty_answer"
+                    result.text = self._partial(
+                        result, _FORCED_WHY.get(forced or "", "produced no answer")
+                    )
                     return result
                 result.text = content
-                result.stop_reason = "answered"
+                # Still marked when forced: the answer is real, but the operator
+                # should know it was written up at a limit, not at a conclusion.
+                result.stop_reason = forced or "answered"
                 return result
 
             # Keep the assistant turn verbatim: the tool_call ids must match the
@@ -408,46 +477,66 @@ class Agent:
                 }
             )
 
-            remaining = settings.agent_max_tool_calls - calls_made
-            if remaining <= 0:
-                result.stop_reason = "tool_budget"
-                messages.append(
-                    self._system_note(
-                        "Tool call budget exhausted. Answer now from what you already have, "
-                        "and say what you did not get to check."
-                    )
-                )
-                continue
+            # Every call gets a reply, in the order it was made: run, pointed at
+            # an earlier identical call, or refused for budget. A call id left
+            # without one is something a strict endpoint rejects the turn over.
+            to_run: list[dict[str, Any]] = []
+            plan: list[tuple[dict[str, Any], str, str | None]] = []
+            first_in_step: dict[tuple[str, str], str] = {}
+            for call in tool_calls:
+                key = self._call_key(call)
+                earlier = fetched.get(key)
+                if earlier is not None and not _is_dropped(earlier):
+                    plan.append((call, "repeat", str(earlier.get("tool_call_id") or "")))
+                elif key in first_in_step:
+                    plan.append((call, "repeat", first_in_step[key]))
+                elif calls_made < settings.agent_max_tool_calls:
+                    calls_made += 1
+                    first_in_step[key] = str(call.get("id") or "")
+                    to_run.append(call)
+                    plan.append((call, "run", None))
+                else:
+                    plan.append((call, "over_budget", None))
 
-            accepted = tool_calls[:remaining]
-            calls_made += len(accepted)
+            if to_run and progress is not None:
+                await progress(self._progress_line(to_run))
 
-            if progress is not None:
-                await progress(self._progress_line(accepted))
+            # Tools get the time before the reserve, not the reserve itself.
+            budget_s = max(1.0, deadline - reserve - time.monotonic())
+            executed = await asyncio.gather(*(self._run_one(call, budget_s) for call in to_run))
+            ran = {id(call): tool_result for call, tool_result in executed}
 
-            budget_s = max(1.0, deadline - time.monotonic())
-            executed = await asyncio.gather(*(self._run_one(call, budget_s) for call in accepted))
-
-            for call, tool_result in executed:
-                record = self._record(call, tool_result)
-                result.tool_calls.append(record)
-                result.redaction_rules.extend(tool_result.redaction_rules)
-                messages.append(
-                    {
+            for call, kind, same_as in plan:
+                name = str((call.get("function") or {}).get("name") or "")
+                if kind == "run":
+                    tool_result = ran[id(call)]
+                    record = self._record(call, tool_result)
+                    result.tool_calls.append(record)
+                    result.redaction_rules.extend(tool_result.redaction_rules)
+                    message = {
                         "role": "tool",
                         "tool_call_id": call.get("id", ""),
                         "name": record.name,
                         "content": wrap_untrusted(record.name, tool_result.json),
                     }
-                )
-
-            if len(tool_calls) > len(accepted):
-                messages.append(
-                    self._system_note(
-                        f"{len(tool_calls) - len(accepted)} further tool call(s) were not run: "
-                        "the per-turn budget is exhausted."
+                    # Only a success is reused: an error may be transient, and
+                    # a retry of it is not waste.
+                    if tool_result.ok:
+                        fetched[self._call_key(call)] = message
+                elif kind == "repeat":
+                    result.repeated_calls += 1
+                    message = self._tool_note(
+                        call,
+                        f"Not run: identical to call {same_as} earlier in this turn. Its "
+                        "result is in the tool message with that id, unchanged.",
                     )
-                )
+                else:
+                    message = self._tool_note(
+                        call, "Not run: the per-turn tool call budget is exhausted."
+                    )
+                messages.append(message)
+                if kind != "run":
+                    audit.emit("tool_skipped", tool=name, ok=True, reason=kind)
 
             dropped = self._enforce_output_budget(messages)
             if dropped:
@@ -460,6 +549,9 @@ class Agent:
                     )
                 )
 
+        # Not reached: the last step is always offered no tools, and every
+        # tool-less reply returns. Kept so a future edit that breaks that fails
+        # as a reported outcome rather than a ``None``.
         result.stop_reason = "iteration_budget"
         result.text = self._partial(result, "hit the iteration limit")
         return result
@@ -500,6 +592,34 @@ class Agent:
     @staticmethod
     def _system_note(text: str) -> dict[str, Any]:
         return {"role": "system", "content": text}
+
+    @staticmethod
+    def _tool_note(call: dict[str, Any], text: str) -> dict[str, Any]:
+        """A reply to a call that was not run. Ours, so not wrapped as untrusted."""
+        function = call.get("function") or {}
+        return {
+            "role": "tool",
+            "tool_call_id": call.get("id", ""),
+            "name": str(function.get("name") or "?"),
+            "content": json.dumps({"not_run": True, "note": text}),
+        }
+
+    @staticmethod
+    def _call_key(call: dict[str, Any]) -> tuple[str, str]:
+        """What makes two calls the same call: the tool, and its arguments as data.
+
+        Arguments are compared parsed, so key order and spacing -- which models
+        vary freely -- do not hide a repeat. Unparseable arguments compare as
+        written; they fail validation either way.
+        """
+        function = call.get("function") or {}
+        raw = function.get("arguments")
+        try:
+            parsed = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+            args = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            args = str(raw)
+        return str(function.get("name") or ""), args
 
     # ---------------------------------------------------------- thread memo --
 

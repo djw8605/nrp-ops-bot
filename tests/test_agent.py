@@ -6,6 +6,7 @@ that the loop's control flow is what is under test.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -46,11 +47,20 @@ class Scripted:
     def __init__(self, turns: list[dict[str, Any]]) -> None:
         self.turns = list(turns)
         self.seen: list[list[dict[str, Any]]] = []
+        #: Whether each call offered the model its tools.
+        self.allowed: list[bool] = []
+        #: Seconds each call takes before replying, in call order; 0 past the end.
+        self.delays: list[float] = []
         self.calls = 0
 
-    async def __call__(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    async def __call__(
+        self, messages: list[dict[str, Any]], *, allow_tools: bool = True
+    ) -> dict[str, Any]:
         self.calls += 1
         self.seen.append([dict(m) for m in messages])
+        self.allowed.append(allow_tools)
+        if self.delays:
+            await asyncio.sleep(self.delays.pop(0))
         return self.turns.pop(0) if self.turns else answer("out of script")
 
 
@@ -91,11 +101,13 @@ class TestLoopControl:
         self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
     ) -> None:
         fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
-        turns = [tool_turn("list_pods", {"namespace": "coder"}, f"c{i}") for i in range(8)]
+        # Distinct namespaces: an identical call repeated is not run at all.
+        turns = [tool_turn("list_pods", {"namespace": f"ns{i}"}, f"c{i}") for i in range(8)]
         agent, _ = make_agent(monkeypatch, turns, agent_max_tool_calls=3, agent_max_iterations=8)
         result = await agent.investigate("coder down?")
         assert len(result.tool_calls) == 3
-        assert result.stop_reason in ("tool_budget", "iteration_budget")
+        assert result.stop_reason == "tool_budget"
+        assert "tool call budget" in result.text
 
     async def test_iteration_budget_is_enforced(
         self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
@@ -136,6 +148,328 @@ class TestLoopControl:
         assert [c.name for c in result.tool_calls] == ["list_pods", "get_events"]
         tool_msgs = [m for m in model.seen[-1] if m.get("role") == "tool"]
         assert [m["tool_call_id"] for m in tool_msgs] == ["a", "b"]
+
+
+@pytest.mark.usefixtures("allow_all_namespaces")
+class TestBudgetsEndInAnAnswer:
+    """A spent budget used to end the turn with "I hit the iteration limit" and a
+    list of tool names, discarding everything the tools had found. The step a
+    budget runs out on is now offered no tools, so the model has to write up
+    what it has instead."""
+
+    async def test_a_spent_tool_budget_gets_a_tool_less_answer_call(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
+        turns = [tool_turn("list_pods", {"namespace": f"ns{i}"}, f"c{i}") for i in range(3)]
+        turns.append(answer("three namespaces, no pods; did not check events"))
+        agent, model = make_agent(monkeypatch, turns, agent_max_tool_calls=3)
+        result = await agent.investigate("anything running?")
+        assert result.text == "three namespaces, no pods; did not check events"
+        assert result.stop_reason == "tool_budget"
+        assert result.ok is True
+        assert model.allowed == [True, True, True, False]
+        note = str(model.seen[-1][-1]["content"])
+        assert "budget" in note and "did not get to check" in note
+
+    async def test_the_last_iteration_is_offered_no_tools(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
+        agent, model = make_agent(
+            monkeypatch,
+            [tool_turn("list_pods", {"namespace": "coder"}), answer("coder has no pods")],
+            agent_max_iterations=2,
+        )
+        result = await agent.investigate("coder down?")
+        assert model.allowed == [True, False]
+        assert result.text == "coder has no pods"
+        assert result.stop_reason == "iteration_budget"
+
+    async def test_tool_calls_on_the_forced_step_are_not_run(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        """An endpoint that ignores ``tool_choice: none`` must not get its way."""
+        fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
+        sneaky = tool_turn("list_pods", {"namespace": "other"}, "c2")
+        sneaky["content"] = "coder has no pods"
+        agent, _ = make_agent(
+            monkeypatch,
+            [tool_turn("list_pods", {"namespace": "coder"}), sneaky],
+            agent_max_iterations=2,
+        )
+        result = await agent.investigate("coder down?")
+        assert [c.arguments["namespace"] for c in result.tool_calls] == ["coder"]
+        assert result.text == "coder has no pods"
+
+    async def test_an_answer_cut_off_on_the_last_step_is_reported_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
+        agent, model = make_agent(
+            monkeypatch,
+            [tool_turn("list_pods", {"namespace": "coder"}), cut_off("coder has no po")],
+            agent_max_iterations=2,
+        )
+        result = await agent.investigate("coder down?")
+        assert model.calls == 2
+        assert result.stop_reason == "truncated"
+        assert result.text == "coder has no po"
+
+    async def test_calls_past_the_budget_still_get_a_tool_message(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        """Every ``tool_call_id`` needs a reply, or a strict endpoint rejects the
+        next request outright."""
+        fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
+        turn = {
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"c{i}",
+                    "type": "function",
+                    "function": {"name": "list_pods", "arguments": json.dumps({"namespace": n})},
+                }
+                for i, n in enumerate(["a", "b", "c"])
+            ],
+        }
+        agent, model = make_agent(monkeypatch, [turn, answer("done")], agent_max_tool_calls=2)
+        result = await agent.investigate("pods?")
+        assert len(result.tool_calls) == 2
+        replies = {m["tool_call_id"]: m for m in model.seen[-1] if m.get("role") == "tool"}
+        assert set(replies) == {"c0", "c1", "c2"}
+        assert "budget" in str(replies["c2"]["content"])
+
+
+@pytest.fixture
+def dispatched(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Names of the tools actually dispatched, in order."""
+    from nrp_ops_agent import agent as agent_module
+
+    real = agent_module.dispatch
+    names: list[str] = []
+
+    async def counting(name: str, arguments: Any, **kwargs: Any) -> Any:
+        names.append(name)
+        return await real(name, arguments, **kwargs)
+
+    monkeypatch.setattr(agent_module, "dispatch", counting)
+    return names
+
+
+@pytest.mark.usefixtures("allow_all_namespaces")
+class TestRepeatedCalls:
+    """A model that loses track re-issues the call it just made, and each repeat
+    used to spend the budget meant for the next question."""
+
+    @pytest.fixture(autouse=True)
+    def _pods(self, fake_kube: Any) -> None:
+        fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
+        fake_kube.core._responses["list_namespaced_event"] = ns(items=[])
+
+    async def test_an_identical_call_is_not_run_twice(
+        self, monkeypatch: pytest.MonkeyPatch, dispatched: list[str]
+    ) -> None:
+        agent, model = make_agent(
+            monkeypatch,
+            [
+                tool_turn("list_pods", {"namespace": "coder"}, "c1"),
+                tool_turn("list_pods", {"namespace": "coder"}, "c2"),
+                answer("no pods"),
+            ],
+        )
+        result = await agent.investigate("coder?")
+        assert dispatched == ["list_pods"]
+        assert len(result.tool_calls) == 1
+        assert result.repeated_calls == 1
+        repeat = next(m for m in model.seen[-1] if m.get("tool_call_id") == "c2")
+        assert "c1" in str(repeat["content"])
+
+    async def test_a_repeat_does_not_spend_the_budget(
+        self, monkeypatch: pytest.MonkeyPatch, dispatched: list[str]
+    ) -> None:
+        agent, model = make_agent(
+            monkeypatch,
+            [
+                tool_turn("list_pods", {"namespace": "coder"}, "c1"),
+                tool_turn("list_pods", {"namespace": "coder"}, "c2"),
+                tool_turn("get_events", {"namespace": "coder"}, "c3"),
+                answer("no pods, no events"),
+            ],
+            agent_max_tool_calls=2,
+        )
+        result = await agent.investigate("coder?")
+        assert dispatched == ["list_pods", "get_events"]
+        assert model.allowed == [True, True, True, False]
+        assert result.text == "no pods, no events"
+
+    async def test_argument_order_does_not_hide_a_repeat(
+        self, monkeypatch: pytest.MonkeyPatch, dispatched: list[str]
+    ) -> None:
+        first = tool_turn("list_pods", {}, "c1")
+        first["tool_calls"][0]["function"]["arguments"] = '{"namespace":"coder","limit":5}'
+        second = tool_turn("list_pods", {}, "c2")
+        second["tool_calls"][0]["function"]["arguments"] = '{"limit": 5, "namespace": "coder"}'
+        agent, _ = make_agent(monkeypatch, [first, second, answer("ok")])
+        await agent.investigate("coder?")
+        assert dispatched == ["list_pods"]
+
+    async def test_a_repeat_within_one_step_runs_once(
+        self, monkeypatch: pytest.MonkeyPatch, dispatched: list[str]
+    ) -> None:
+        call = {"name": "list_pods", "arguments": '{"namespace":"coder"}'}
+        turn = {
+            "content": None,
+            "tool_calls": [
+                {"id": "a", "type": "function", "function": call},
+                {"id": "b", "type": "function", "function": call},
+            ],
+        }
+        agent, model = make_agent(monkeypatch, [turn, answer("ok")])
+        await agent.investigate("coder?")
+        assert dispatched == ["list_pods"]
+        replies = [m["tool_call_id"] for m in model.seen[-1] if m.get("role") == "tool"]
+        assert replies == ["a", "b"]
+
+    async def test_a_failed_call_may_be_retried(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any, dispatched: list[str]
+    ) -> None:
+        """An error can be transient; a retry of it is not waste."""
+        fake_kube.core._responses["list_namespaced_pod"] = RuntimeError("api on fire")
+        agent, _ = make_agent(
+            monkeypatch,
+            [
+                tool_turn("list_pods", {"namespace": "coder"}, "c1"),
+                tool_turn("list_pods", {"namespace": "coder"}, "c2"),
+                answer("the API is unhealthy"),
+            ],
+        )
+        await agent.investigate("coder?")
+        assert dispatched == ["list_pods", "list_pods"]
+
+    async def test_a_dropped_result_may_be_fetched_again(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any, dispatched: list[str]
+    ) -> None:
+        """The drop note tells the model to re-run what it needs; a pointer to a
+        result that is no longer there would leave it with nothing."""
+        fake_kube.core._responses["read_namespaced_pod_log"] = "x" * 40_000
+        logs = {"namespace": "coder", "pod": "p0"}
+        agent, _ = make_agent(
+            monkeypatch,
+            [
+                tool_turn("get_logs", logs, "c0"),
+                tool_turn("get_logs", {"namespace": "coder", "pod": "p1"}, "c1"),
+                tool_turn("get_logs", logs, "c2"),
+                answer("done"),
+            ],
+            agent_tool_output_token_budget=10_000,
+        )
+        result = await agent.investigate("coder logs")
+        assert result.dropped_results > 0
+        assert dispatched == ["get_logs", "get_logs", "get_logs"]
+
+    async def test_a_follow_up_turn_runs_its_calls_afresh(
+        self, monkeypatch: pytest.MonkeyPatch, dispatched: list[str]
+    ) -> None:
+        """Carried results may be stale; only this turn's results are reused."""
+        agent, _ = make_agent(
+            monkeypatch, [tool_turn("list_pods", {"namespace": "coder"}), answer("none")]
+        )
+        await agent.investigate("coder?", thread_key="C0OPS:1")
+        monkeypatch.setattr(
+            agent,
+            "_complete",
+            Scripted([tool_turn("list_pods", {"namespace": "coder"}, "c9"), answer("still none")]),
+        )
+        await agent.investigate("now?", thread_key="C0OPS:1")
+        assert dispatched == ["list_pods", "list_pods"]
+
+
+@pytest.mark.usefixtures("allow_all_namespaces")
+class TestTimeReserve:
+    """The wall clock used to end a turn with "I ran out of time" and a list of
+    tool names, discarding every result. The last stretch of it is now kept
+    for writing the answer. Real time, scaled down: a turn of a second or so."""
+
+    async def test_a_slow_step_hands_over_to_a_tool_less_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tool-enabled call may not run into the reserve: it is cut off at
+        the reserve's edge and the answer is asked for instead."""
+        # The first call is cancelled before it replies, so the one scripted
+        # turn is what the answer step gets.
+        agent, model = make_agent(
+            monkeypatch,
+            [answer("ran out of time; no data")],
+            agent_wall_clock_timeout_s=1.0,
+            agent_answer_reserve_s=0.8,
+        )
+        model.delays = [0.5]
+        result = await agent.investigate("coder down?")
+        assert model.allowed == [True, False]
+        assert result.tool_calls == []
+        assert result.text == "ran out of time; no data"
+        assert result.stop_reason == "time_budget"
+        assert result.ok is True
+        note = str(model.seen[-1][-1]["content"])
+        assert "time" in note and "did not get to check" in note
+
+    async def test_slow_tools_hand_over_to_a_tool_less_answer(
+        self, monkeypatch: pytest.MonkeyPatch, fake_kube: Any
+    ) -> None:
+        from nrp_ops_agent import agent as agent_module
+
+        fake_kube.core._responses["list_namespaced_pod"] = ns(items=[], metadata=ns(_continue=None))
+        real = agent_module.dispatch
+
+        async def slow(name: str, arguments: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.6)
+            return await real(name, arguments, **kwargs)
+
+        monkeypatch.setattr(agent_module, "dispatch", slow)
+        agent, model = make_agent(
+            monkeypatch,
+            [
+                tool_turn("list_pods", {"namespace": "coder"}),
+                answer("coder has no pods; did not check other"),
+            ],
+            agent_wall_clock_timeout_s=1.0,
+            agent_answer_reserve_s=0.5,
+        )
+        result = await agent.investigate("coder down?")
+        assert model.allowed == [True, False]
+        assert [c.arguments["namespace"] for c in result.tool_calls] == ["coder"]
+        assert result.text == "coder has no pods; did not check other"
+        assert result.stop_reason == "time_budget"
+
+    async def test_a_timeout_during_the_answer_is_still_a_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, model = make_agent(
+            monkeypatch,
+            [answer("never seen"), answer("never seen either")],
+            agent_wall_clock_timeout_s=0.5,
+            agent_answer_reserve_s=0.4,
+        )
+        model.delays = [0.3, 5.0]
+        result = await agent.investigate("coder down?")
+        assert model.allowed == [True, False]
+        assert result.stop_reason == "timeout"
+        assert result.ok is False
+
+    async def test_a_zero_reserve_leaves_the_old_behaviour(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, model = make_agent(
+            monkeypatch,
+            [answer("slow but fine")],
+            agent_wall_clock_timeout_s=1.0,
+            agent_answer_reserve_s=0.0,
+        )
+        model.delays = [0.5]
+        result = await agent.investigate("coder down?")
+        assert model.allowed == [True]
+        assert result.stop_reason == "answered"
 
 
 @pytest.mark.usefixtures("allow_all_namespaces")
@@ -459,7 +793,7 @@ class TestFailureContainment:
     ) -> None:
         agent, _ = make_agent(monkeypatch, [])
 
-        async def _boom(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        async def _boom(messages: list[dict[str, Any]], **_: Any) -> dict[str, Any]:
             raise ModelError("gateway exploded")
 
         monkeypatch.setattr(agent, "_complete", _boom)

@@ -65,6 +65,14 @@ class TestSettings:
         assert settings.llm_timeout_s == 180.0
         assert settings.llm_timeout_s < settings.agent_wall_clock_timeout_s
 
+    def test_the_answer_reserve_fits_inside_the_turn(self) -> None:
+        """A reserve as long as the turn would leave no time to investigate:
+        every turn would answer before calling a single tool."""
+        settings = Settings(_env_file=None)
+        assert 0 < settings.agent_answer_reserve_s < settings.agent_wall_clock_timeout_s
+        with pytest.raises(ValueError, match="agent_answer_reserve_s"):
+            Settings(_env_file=None, agent_wall_clock_timeout_s=60, agent_answer_reserve_s=60)
+
     def test_settings_are_frozen(self) -> None:
         settings = Settings(_env_file=None)
         with pytest.raises(ValueError, match="frozen"):

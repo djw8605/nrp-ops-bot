@@ -244,11 +244,31 @@ tool would refuse.
 
 ## Agent loop
 
-Hand-rolled in `agent.py`, around 600 lines, no agent framework. Budgets, all env-driven: 12 tool
-calls per turn, 8 loop iterations, 120 s wall clock, 60k tokens of accumulated tool output. When the
+Hand-rolled in `agent.py`, around 700 lines, no agent framework. Budgets, all env-driven: 24 tool
+calls per turn, 16 loop iterations, 300 s wall clock, 60k tokens of accumulated tool output. When the
 output cap is hit the oldest results are dropped **and the model is told they were dropped**, so it
 does not silently reason from a truncated picture. Model faults, tool faults and timeouts all become
 reported outcomes rather than exceptions.
+
+### When a budget runs out
+
+A spent budget ends the turn with an answer, not a shrug. The step on which the tool call budget is
+exhausted, the step that starts inside the last 90 s of the wall clock, and the last iteration in
+any case, is sent with `tool_choice: none` and a note telling the model to answer from what it has
+and say what it did not get to check. A tool call the endpoint returns anyway is not run. The reply
+is posted with `stopped: tool_budget`, `stopped: time_budget` or `stopped: iteration_budget` beneath
+it, so the operator knows it was written up at a limit.
+
+The time reserve is enforced on both sides of it: a model call that may still use tools is cut off
+when it reaches the reserve, and tools are given only the time before it. Only the answer call runs
+inside the reserve, and if even that misses the deadline, the turn ends as `timeout`.
+
+A call identical to one already answered this turn — same tool, same arguments, compared parsed so
+key order does not matter — is not run again. It gets a tool message pointing at the earlier call's
+id, and it does not count against the tool budget. Failed calls are not reused (an error may be
+transient), nor are results the output budget has dropped, nor results carried from a previous turn
+in the thread (they may be stale). Calls past the budget still get a tool message saying so: a
+`tool_call_id` with no reply is something a strict endpoint rejects the next request over.
 
 ### An answer cut off at the output limit
 
@@ -344,10 +364,11 @@ endpoint, credential, namespace or Slack ID is hardcoded anywhere else in the pa
 | `NRP_OPS_LLM_API_KEY` / `_MODEL` | — | `_MODEL` has no default on purpose |
 | `NRP_OPS_LLM_TEMPERATURE` / `_MAX_TOKENS` | `0.0` / `100000` | the served model's own output ceiling; see below |
 | `NRP_OPS_LLM_TIMEOUT_S` | `180` | one model call; must stay under the wall clock |
-| `NRP_OPS_AGENT_MAX_TOOL_CALLS` | `12` | per turn |
-| `NRP_OPS_AGENT_MAX_ITERATIONS` | `8` | loop iterations |
+| `NRP_OPS_AGENT_MAX_TOOL_CALLS` | `24` | per turn; identical repeats are not counted |
+| `NRP_OPS_AGENT_MAX_ITERATIONS` | `16` | loop iterations; the last is always tool-less |
 | `NRP_OPS_AGENT_MAX_TRUNCATION_RETRIES` | `1` | re-asks for a shorter answer when one is cut off; `0` posts the partial, marked |
 | `NRP_OPS_AGENT_WALL_CLOCK_TIMEOUT_S` | `300` | the whole turn; the real bound once `_MAX_TOKENS` is this high |
+| `NRP_OPS_AGENT_ANSWER_RESERVE_S` | `90` | tail of the wall clock kept for a tool-less answer; must be under it; `0` disables |
 | `NRP_OPS_AGENT_TOOL_OUTPUT_TOKEN_BUDGET` | `60000` | oldest results dropped past this |
 | `NRP_OPS_AGENT_THREAD_MEMO_CHAR_BUDGET` | `20000` | previous turn's tool results carried into a follow-up; `0` disables |
 | `NRP_OPS_AGENT_THREAD_MEMO_TTL_S` | `1800` | past this a follow-up starts clean |
@@ -449,7 +470,8 @@ One JSON object per line on stdout. Stable keys; absent fields are omitted rathe
 | `ok` | bool | outcome-bearing events |
 
 `event` is one of `startup`, `policy_reload`, `authz_allow`, `authz_deny`, `model_call`,
-`model_error`, `model_truncated`, `tool_call`, `tool_error`, `redaction_hit`, `thread_history`,
+`model_error`, `model_truncated`, `tool_call`, `tool_error`, `tool_skipped`, `redaction_hit`,
+`thread_history`,
 `chart_upload`, `reply_sent`.
 
 `model_call` carries `finish_reason` alongside its token counts. `length` there is the endpoint

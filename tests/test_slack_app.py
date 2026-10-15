@@ -401,11 +401,13 @@ class TestFormatReply:
             text="partial",
             stop_reason="tool_budget",
             dropped_results=2,
+            repeated_calls=3,
             redaction_rules=["jwt", "jwt", "bearer_token"],
         )
         out = format_reply(result)
         assert "stopped: tool_budget" in out
         assert "2 tool result(s) dropped" in out
+        assert "3 repeated call(s)" in out
         assert "jwt, bearer_token" in out
 
     def test_a_clean_answer_has_no_footnote_line(self) -> None:

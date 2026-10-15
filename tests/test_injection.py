@@ -242,7 +242,7 @@ class ScriptedModel:
         self._turns = list(turns)
         self.seen: list[list[dict[str, Any]]] = []
 
-    async def __call__(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    async def __call__(self, messages: list[dict[str, Any]], **_: Any) -> dict[str, Any]:
         self.seen.append([dict(m) for m in messages])
         return self._turns.pop(0) if self._turns else {"content": "done", "tool_calls": []}
 

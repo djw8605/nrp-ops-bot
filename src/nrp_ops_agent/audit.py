@@ -42,6 +42,9 @@ AuditEvent = Literal[
     "model_truncated",
     "tool_call",
     "tool_error",
+    # A call the loop answered without running: `reason` is `repeat` (identical
+    # to an earlier call this turn) or `over_budget`.
+    "tool_skipped",
     "redaction_hit",
     "reply_sent",
     "thread_history",

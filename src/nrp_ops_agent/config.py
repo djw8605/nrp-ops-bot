@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 KubeMode = Literal["auto", "incluster", "kubeconfig"]
@@ -217,8 +217,14 @@ class Settings(BaseSettings):
     llm_timeout_s: float = Field(default=180.0, gt=0, le=600)
 
     # ----------------------------------------------------------------- Agent --
-    agent_max_tool_calls: int = Field(default=12, ge=1, le=64)
-    agent_max_iterations: int = Field(default=8, ge=1, le=32)
+    # Raised from 12/8 once neither could cost a turn its answer: the step a
+    # budget runs out on is offered no tools and must write up what it has, and
+    # an identical repeat of a call is pointed at its earlier result rather than
+    # spending the budget. What bounds a turn is `agent_wall_clock_timeout_s`
+    # and the tool output budget; these two only stop a model that will not
+    # conclude. The last iteration is always the tool-less one.
+    agent_max_tool_calls: int = Field(default=24, ge=1, le=64)
+    agent_max_iterations: int = Field(default=16, ge=1, le=32)
     agent_max_truncation_retries: int = Field(
         default=1,
         ge=0,
@@ -233,6 +239,16 @@ class Settings(BaseSettings):
     # with the chart already uploaded and the prose lost. Operators are not left
     # guessing during the wait -- see `slack_progress_heartbeat_s`.
     agent_wall_clock_timeout_s: float = Field(default=300.0, gt=0, le=900)
+    # The tail of the turn kept for writing the answer. Without it the deadline
+    # landed mid-investigation and the turn posted "ran out of time" with every
+    # result discarded. Sized for the answer call itself: on a context grown to
+    # 60k tokens, prefill alone takes most of a minute.
+    agent_answer_reserve_s: float = Field(
+        default=90.0,
+        ge=0,
+        description="Seconds at the end of the wall clock kept for a tool-less answer. "
+        "Once fewer remain, the model is asked to answer from what it has. 0 disables.",
+    )
     # A follow-up in a thread ("continue", "is it still broken?") reaches the
     # model with the bot's earlier *text* but none of the tool results behind it,
     # so it re-runs the whole investigation to answer. The last turn's tool
@@ -276,6 +292,17 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @model_validator(mode="after")
+    def _reserve_fits_the_turn(self) -> Settings:
+        # A reserve as long as the turn leaves no time to investigate: every
+        # turn would answer before calling a tool. Refused at startup rather
+        # than discovered as a bot that never looks at anything.
+        if self.agent_answer_reserve_s >= self.agent_wall_clock_timeout_s:
+            raise ValueError(
+                "agent_answer_reserve_s must be shorter than agent_wall_clock_timeout_s"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

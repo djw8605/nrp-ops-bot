@@ -361,6 +361,7 @@ class SlackOps:
                 result_bytes=len(reply.encode("utf-8")),
                 extra={
                     "tool_calls": len(result.tool_calls),
+                    "repeated_calls": result.repeated_calls,
                     "iterations": result.iterations,
                     "charts": len(result.charts),
                 },
@@ -411,6 +412,8 @@ def format_reply(result: AgentResult) -> str:
         footnotes.append(f"stopped: {result.stop_reason}")
     if result.dropped_results:
         footnotes.append(f"{result.dropped_results} tool result(s) dropped for context budget")
+    if result.repeated_calls:
+        footnotes.append(f"{result.repeated_calls} repeated call(s) answered from earlier results")
     if result.redaction_rules:
         unique = ", ".join(dict.fromkeys(result.redaction_rules))
         footnotes.append(f"redacted from tool output: {unique}")
